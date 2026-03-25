@@ -1,0 +1,17 @@
+# PlatformIO build artifacts
+firmware/.pio/
+
+# Python
+python/__pycache__/
+python/*.pyc
+python/*.pyo
+python/.env
+python/venv/
+python/env/
+
+# VS Code
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
