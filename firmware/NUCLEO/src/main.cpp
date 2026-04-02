@@ -15,7 +15,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
-#include "pin_config.h"
+#include "pinconfig.h"
 
 // ──────────────────────────────────────────────────────────
 //  Forward declarations
