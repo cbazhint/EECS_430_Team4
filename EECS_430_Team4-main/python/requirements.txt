@@ -1,4 +1,0 @@
-pyserial
-opencv-python
-numpy
-matplotlib
