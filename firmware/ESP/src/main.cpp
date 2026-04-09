@@ -47,7 +47,7 @@
 #define CHANNEL_MODE_HOP    1
 #define CHANNEL_MODE_LOCK   2
 
-#define CHANNEL_MODE        CHANNEL_MODE_LOCK
+#define CHANNEL_MODE        CHANNEL_MODE_FIXED
 #define WIFI_CHANNEL        6        /* used only in FIXED mode */
 #define CHANNEL_MIN         1
 #define CHANNEL_MAX         13
