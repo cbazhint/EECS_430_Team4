@@ -38,7 +38,7 @@
 #define UART_TX_PIN         17
 #define UART_RX_PIN         18
 #define UART_BAUD           921600
-#define CSI_SUBCARRIER_IDX  0
+#define CSI_SUBCARRIER_IDX  10  // 0 is DC (always zero); use 1-28 for LLTF data subcarriers
 #define SYNC_BYTE           0xAA
 #define PACKET_SIZE         11
 
@@ -65,13 +65,24 @@ static bool     channel_locked     = false;
 static uint32_t last_hop_time      = 0;
 static uint32_t packets_on_channel = 0;
 
+/* Debug counters - incremented in callback, printed from loop() */
+static volatile uint32_t dbg_cb_total    = 0;  // every callback entry
+static volatile uint32_t dbg_cb_null     = 0;  // dropped: null/short info
+static volatile uint32_t dbg_cb_bounds   = 0;  // dropped: subcarrier out of range
+static volatile uint32_t dbg_cb_zero     = 0;  // dropped: I=0 Q=0
+static volatile uint32_t dbg_cb_ok       = 0;  // passed all checks → phase computed
+static volatile uint32_t dbg_promisc     = 0;  // raw promiscuous packet counter
+
 /* ============================================================
    CSI Callback - called from WiFi task context
    ============================================================ */
 void IRAM_ATTR csi_rx_callback(void *ctx, wifi_csi_info_t *info)
 {
+    dbg_cb_total++;
+
     if (info == NULL || info->buf == NULL || info->len < 2)
     {
+        dbg_cb_null++;
         return;
     }
 
@@ -80,14 +91,16 @@ void IRAM_ATTR csi_rx_callback(void *ctx, wifi_csi_info_t *info)
     int idx = CSI_SUBCARRIER_IDX * 2;
     if (idx + 1 >= info->len)
     {
+        dbg_cb_bounds++;
         return;
     }
 
-    int8_t imag = (int8_t)info->buf[idx];
+    int8_t imag      = (int8_t)info->buf[idx];
     int8_t real_part = (int8_t)info->buf[idx + 1];
 
     if (imag == 0 && real_part == 0)
     {
+        dbg_cb_zero++;
         return;
     }
 
@@ -97,6 +110,7 @@ void IRAM_ATTR csi_rx_callback(void *ctx, wifi_csi_info_t *info)
     csi_timestamp  = ts;
     csi_data_ready = true;
     packets_on_channel++;
+    dbg_cb_ok++;
 }
 
 /* ============================================================
@@ -156,6 +170,7 @@ void setup_wifi_promiscuous()
     delay(100);
 
     esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb([](void*, wifi_promiscuous_pkt_type_t){ dbg_promisc++; });
 
     /* Set initial channel */
     if (CHANNEL_MODE == CHANNEL_MODE_FIXED)
@@ -168,7 +183,7 @@ void setup_wifi_promiscuous()
         last_hop_time = millis();
     }
 
-    wifi_csi_config_t csi_config;
+    wifi_csi_config_t csi_config = {};   // zero-init all fields first
     csi_config.lltf_en           = true;
     csi_config.htltf_en          = true;
     csi_config.stbc_htltf2_en    = true;
@@ -177,9 +192,13 @@ void setup_wifi_promiscuous()
     csi_config.manu_scale        = false;
     csi_config.shift             = false;
 
-    esp_wifi_set_csi_config(&csi_config);
-    esp_wifi_set_csi_rx_cb(csi_rx_callback, NULL);
-    esp_wifi_set_csi(true);
+    esp_err_t err;
+    err = esp_wifi_set_csi_config(&csi_config);
+    Serial.printf("[Node %d] csi_config: %s\n", NODE_ID, esp_err_to_name(err));
+    err = esp_wifi_set_csi_rx_cb(csi_rx_callback, NULL);
+    Serial.printf("[Node %d] csi_rx_cb:  %s\n", NODE_ID, esp_err_to_name(err));
+    err = esp_wifi_set_csi(true);
+    Serial.printf("[Node %d] csi_enable: %s\n", NODE_ID, esp_err_to_name(err));
 }
 
 /* ============================================================
@@ -251,6 +270,17 @@ void loop()
 {
     /* Handle channel hopping if enabled */
     update_channel();
+
+    /* Print diagnostic counters every 2 seconds */
+    static uint32_t last_diag = 0;
+    if (millis() - last_diag >= 2000)
+    {
+        last_diag = millis();
+        Serial.printf("[Node %d] ch=%d | promisc=%lu | csi: total=%lu null=%lu bounds=%lu zero=%lu ok=%lu\n",
+                      NODE_ID, current_channel,
+                      dbg_promisc,
+                      dbg_cb_total, dbg_cb_null, dbg_cb_bounds, dbg_cb_zero, dbg_cb_ok);
+    }
 
     if (csi_data_ready)
     {

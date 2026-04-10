@@ -23,6 +23,10 @@
 #define ESP_BAUD            921600   // High speed for CSI data throughput
 #define NRF24_SPI_SPEED     8000000  // 8 MHz SPI clock for nRF24L01+
 
+// CSI packet protocol (must match ESP32 firmware)
+#define SYNC_BYTE           0xAA
+#define PACKET_SIZE         11       // bytes per CSI packet
+
 // ──────────────────────────────────────────────────────────
 //  Debug Serial — USART3 via ST-Link VCP
 //  PD8 (TX) / PD9 (RX) — hardwired on Nucleo, handled by Serial

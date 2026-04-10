@@ -1,67 +1,76 @@
 /*
- * ESP32-S3-DevKitC-1U — Raw 802.11 Transmitter
- * Receiver only needs promiscuous mode — no ESP-NOW stack required.
+ * ESP32-S3 — ESP-NOW Beacon Transmitter
+ *
+ * Sends broadcast ESP-NOW frames on a fixed channel.
+ * ESP-NOW uses properly formatted 802.11 Action frames which trigger
+ * real CSI capture on the receiving nodes (unlike raw esp_wifi_80211_tx
+ * which doesn't reliably produce non-zero I/Q values).
+ *
+ * Receiver only needs promiscuous mode + CSI enabled — no ESP-NOW
+ * stack required on the receiver side.
  */
 
 #include <WiFi.h>
+#include <esp_now.h>
 #include "esp_wifi.h"
 
-#define NODE_ID    0
-#define WIFI_CHAN  6
-#define MAGIC      0xDE  // filter byte so receiver ignores unrelated frames
+#define WIFI_CHAN       6
+#define TX_INTERVAL_MS  10   // 100 Hz — fast enough for good CSI snapshots
 
-// Minimal 802.11 data frame header (24 bytes)
-static const uint8_t frame_header[] = {
-    0x08, 0x00,                          // Frame Control: data frame
-    0x00, 0x00,                          // Duration
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // Destination: broadcast
-    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, // Source MAC (placeholder)
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // BSSID: broadcast
-    0x00, 0x00                           // Sequence control
-};
-
-typedef struct __attribute__((packed)) {
-    uint8_t  magic;          // 0xDE — lets receiver filter quickly
-    uint8_t  node_id;
-    uint32_t timestamp_us;
-    float    phase_rad;
-    uint8_t  checksum;       // XOR of preceding bytes
-} Payload;
-
-void build_and_send()
-{
-    Payload p;
-    p.magic        = MAGIC;
-    p.node_id      = NODE_ID;
-    p.timestamp_us = (uint32_t)(esp_timer_get_time() & 0xFFFFFFFF);
-    p.phase_rad    = 1.234f;   // replace with real CSI phase
-
-    // Checksum over everything except the checksum byte itself
-    uint8_t chk = 0;
-    uint8_t *raw = (uint8_t *)&p;
-    for (size_t i = 0; i < sizeof(p) - 1; i++) chk ^= raw[i];
-    p.checksum = chk;
-
-    // Assemble full frame: header + payload
-    uint8_t frame[sizeof(frame_header) + sizeof(p)];
-    memcpy(frame, frame_header, sizeof(frame_header));
-    memcpy(frame + sizeof(frame_header), &p, sizeof(p));
-
-    esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), false);
-}
+static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 void setup()
 {
     Serial.begin(115200);
+    while (!Serial) delay(10);
+
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
+    delay(100);
+
+    // Lock to the correct channel before ESP-NOW init
     esp_wifi_set_channel(WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
-    Serial.printf("[TX] Raw frame transmitter ready on ch%d\n", WIFI_CHAN);
+
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println("[TX] ERROR: ESP-NOW init failed");
+        return;
+    }
+
+    // Register broadcast peer
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, broadcast_addr, 6);
+    peer.channel = WIFI_CHAN;
+    peer.encrypt = false;
+
+    if (esp_now_add_peer(&peer) != ESP_OK)
+    {
+        Serial.println("[TX] ERROR: add peer failed");
+        return;
+    }
+
+    Serial.printf("[TX] ESP-NOW beacon transmitter ready on ch%d @ %dHz\n",
+                  WIFI_CHAN, 1000 / TX_INTERVAL_MS);
 }
 
 void loop()
 {
-    build_and_send();
-    Serial.println("[TX] Frame sent");
-    delay(100);
+    static uint32_t seq = 0;
+
+    // Payload just needs to exist — content doesn't matter for CSI
+    uint8_t data[4];
+    data[0] = 0xDE;               // magic
+    data[1] = 0xAD;
+    data[2] = (seq >> 8) & 0xFF;
+    data[3] =  seq       & 0xFF;
+    seq++;
+
+    esp_err_t result = esp_now_send(broadcast_addr, data, sizeof(data));
+
+    if (result == ESP_OK)
+        Serial.printf("[TX] seq=%lu sent\n", seq);
+    else
+        Serial.printf("[TX] send error: %s\n", esp_err_to_name(result));
+
+    delay(TX_INTERVAL_MS);
 }

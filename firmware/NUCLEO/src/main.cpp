@@ -15,7 +15,20 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <math.h>
 #include "pinconfig.h"
+
+// ──────────────────────────────────────────────────────────
+//  Calibration configuration
+// ──────────────────────────────────────────────────────────
+#define CAL_SAMPLES       20      // phase measurements averaged per node
+#define CAL_TIMEOUT_MS   500      // max wait for one packet from a node (ms)
+
+// ──────────────────────────────────────────────────────────
+//  Calibration state  (populated once at boot by runCalibration)
+// ──────────────────────────────────────────────────────────
+static float phaseCorrection[NUM_ESP_NODES] = {0.0f};  // correction[i] = phase[0] - phase[i]
+static bool  calDone = false;
 
 // ──────────────────────────────────────────────────────────
 //  Forward declarations
@@ -28,6 +41,8 @@ bool testNRF24Link();
 void printBootBanner();
 void printBootDiagnostics();
 void setRFSwitch(bool toReference);
+bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t timeoutMs);
+void runCalibration();
 
 // ──────────────────────────────────────────────────────────
 //  UART handles for the 8 ESP32 nodes
@@ -94,6 +109,9 @@ void setup() {
     setRFSwitch(false);
     Serial.println("[BOOT] RF switches set to ANTENNA path (CTRL=LOW)");
 
+    // ── 7. One-shot calibration via nRF reference path ──
+    runCalibration();
+
     // ── Done ────────────────────────────────────────────
     bootStatus.bootTimeMs = millis() - bootStart;
     printBootDiagnostics();
@@ -107,7 +125,7 @@ void loop() {
     // Future: main operational state machine
     //   STATE_IDLE → STATE_CALIBRATE → STATE_CAPTURE → STATE_PROCESS
     //
-    // For now, echo anything received from any ESP32 to debug serial
+    // For i, echo anything received from any ESP32 to debug serial
     for (int i = 0; i < NUM_ESP_NODES; i++) {
         if (espSerials[i]->available()) {
             Serial.print("[ESP");
@@ -276,6 +294,136 @@ void setRFSwitch(bool toReference) {
     // CTRL=LOW  → RFIN-RF1 (antenna path, normal operation)
     // CTRL=HIGH → RFIN-RF2 (reference/calibration path from Wilkinson)
     digitalWrite(RF_SWITCH_CTRL_PIN, toReference ? HIGH : LOW);
+}
+
+// ──────────────────────────────────────────────────────────
+//  CSI packet parser
+// ──────────────────────────────────────────────────────────
+
+// Reads one 11-byte binary packet from a node's UART.
+// Hunts for the 0xAA sync byte, then reads the remaining 10 bytes,
+// validates the XOR checksum, and extracts nodeId + phase.
+// Returns true on success, false on timeout or checksum failure.
+bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t timeoutMs)
+{
+    uint32_t deadline = millis() + timeoutMs;
+
+    while (millis() < deadline)
+    {
+        if (!ser->available()) continue;
+
+        // Hunt for sync byte
+        if (ser->read() != SYNC_BYTE) continue;
+
+        // Read remaining 10 bytes with a short inner timeout
+        uint8_t buf[PACKET_SIZE - 1];
+        uint32_t innerDeadline = millis() + 50;
+        int n = 0;
+        while (n < (PACKET_SIZE - 1) && millis() < innerDeadline)
+        {
+            if (ser->available()) buf[n++] = ser->read();
+        }
+        if (n < (PACKET_SIZE - 1)) continue;  // incomplete — resync
+
+        // Validate XOR checksum: XOR of all 11 bytes (including sync) must be 0
+        uint8_t chk = SYNC_BYTE;
+        for (int i = 0; i < PACKET_SIZE - 2; i++) chk ^= buf[i];
+        if (chk != buf[PACKET_SIZE - 2]) continue;  // bad checksum — resync
+
+        // Extract fields
+        *nodeId = buf[0];
+        // buf[1..4] = timestamp (not needed for calibration)
+        memcpy(phase, &buf[5], sizeof(float));
+        return true;
+    }
+    return false;  // timed out
+}
+
+// ──────────────────────────────────────────────────────────
+//  Calibration
+// ──────────────────────────────────────────────────────────
+
+// Runs once at boot:
+//   1. Switches all RF paths to the nRF reference signal
+//   2. Collects CAL_SAMPLES phase measurements from each node
+//   3. Computes a circular mean phase per node (handles ±π wrap correctly)
+//   4. Normalises to node 0: correction[i] = meanPhase[0] - meanPhase[i]
+//   5. Switches RF paths back to antenna
+//
+// The correction vector is stored in phaseCorrection[] and applied
+// to every measurement taken during normal operation.
+void runCalibration()
+{
+    Serial.println("[CAL] ── Calibration start ──────────────────");
+    Serial.println("[CAL] Switching RF to REFERENCE path (nRF signal)");
+    setRFSwitch(true);
+    delay(50);  // let RF switch and nRF settle
+
+    // Circular mean accumulators: average phases with sin/cos sums
+    // to handle the ±π wrap-around correctly
+    double sinSum[NUM_ESP_NODES] = {};
+    double cosSum[NUM_ESP_NODES] = {};
+    int    count[NUM_ESP_NODES]  = {};
+
+    Serial.printf("[CAL] Collecting %d samples per node...\n", CAL_SAMPLES);
+
+    for (int node = 0; node < NUM_ESP_NODES; node++)
+    {
+        Serial.printf("[CAL]   Node %d: ", node);
+
+        for (int s = 0; s < CAL_SAMPLES; s++)
+        {
+            uint8_t rxId;
+            float   rxPhase;
+
+            if (readCSIPacket(espSerials[node], &rxId, &rxPhase, CAL_TIMEOUT_MS))
+            {
+                sinSum[node] += sin((double)rxPhase);
+                cosSum[node] += cos((double)rxPhase);
+                count[node]++;
+                Serial.print(".");
+            }
+            else
+            {
+                Serial.print("x");  // timed out — node not responding
+            }
+        }
+
+        Serial.printf("  (%d/%d)\n", count[node], CAL_SAMPLES);
+    }
+
+    // Compute circular mean phase per node, then correction relative to node 0
+    float meanPhase[NUM_ESP_NODES] = {};
+
+    for (int node = 0; node < NUM_ESP_NODES; node++)
+    {
+        if (count[node] > 0)
+        {
+            meanPhase[node] = (float)atan2(
+                sinSum[node] / count[node],
+                cosSum[node] / count[node]
+            );
+        }
+        else
+        {
+            Serial.printf("[CAL] WARN: Node %d returned no data — correction = 0\n", node);
+            meanPhase[node] = 0.0f;
+        }
+    }
+
+    Serial.println("[CAL] Correction vector (node 0 = reference):");
+    for (int node = 0; node < NUM_ESP_NODES; node++)
+    {
+        phaseCorrection[node] = meanPhase[0] - meanPhase[node];
+        Serial.printf("[CAL]   Node %d  mean=% .4f rad  correction=% .4f rad\n",
+                      node, meanPhase[node], phaseCorrection[node]);
+    }
+
+    setRFSwitch(false);
+    calDone = true;
+    Serial.println("[CAL] RF switch returned to ANTENNA path");
+    Serial.println("[CAL] ── Calibration complete ───────────────");
+    Serial.println();
 }
 
 // ──────────────────────────────────────────────────────────
