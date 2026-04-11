@@ -23,6 +23,16 @@
 #define ESP_BAUD            921600   // High speed for CSI data throughput
 #define NRF24_SPI_SPEED     8000000  // 8 MHz SPI clock for nRF24L01+
 
+// CSI packet protocol (must match ESP32 firmware)
+#define SYNC_BYTE           0xAA
+#define PACKET_SIZE         11       // bytes per CSI packet
+
+// nRF24L01+ calibration channel
+// nRF channel N = (2400 + N) MHz → WiFi ch 6 (2437 MHz) = nRF ch 37
+// Must match WIFI_CHANNEL in ESP32 firmware
+#define NRF24_WIFI_CHANNEL  37
+#define NRF24_CAL_ADDRESS   "CALIB"  // 5-byte pipe address for cal packets
+
 // ──────────────────────────────────────────────────────────
 //  Debug Serial — USART3 via ST-Link VCP
 //  PD8 (TX) / PD9 (RX) — hardwired on Nucleo, handled by Serial
@@ -37,8 +47,8 @@
 //    MOSI = PA7  (CN7 pin 14, D11)  ** check SB31 for Ethernet conflict **
 //  CS and CE are generic GPIOs — pick two free pins
 // ──────────────────────────────────────────────────────────
-#define NRF24_CS_PIN        PB_6    // TODO: confirm from your CubeMX
-#define NRF24_CE_PIN        PB_7    // TODO: confirm from your CubeMX
+#define NRF24_CS_PIN        PG_7   
+#define NRF24_CE_PIN        PG_6    
 
 // ──────────────────────────────────────────────────────────
 //  RF Switch — BGS12WN6 shared CTRL
@@ -48,7 +58,7 @@
 //
 //  Pick any free GPIO with no alternate-function conflict.
 // ──────────────────────────────────────────────────────────
-#define RF_SWITCH_CTRL_PIN  PC_6    // TODO: confirm from your CubeMX
+#define RF_SWITCH_CTRL_PIN  PF_1    // TODO: confirm from your CubeMX
 
 // ──────────────────────────────────────────────────────────
 //  ESP32 Node UARTs
@@ -69,28 +79,28 @@
 // ──────────────────────────────────────────────────────────
 
 // ESP32 Node 1 — USART1
-#define ESP1_UART_TX        PA_9    // TODO: verify — may conflict with USB OTG
-#define ESP1_UART_RX        PA_10   // TODO: verify
+#define ESP1_UART_TX        PB_6   
+#define ESP1_UART_RX        PB_7  
 
 // ESP32 Node 2 — USART2
-#define ESP2_UART_TX        PD_5    // TODO: verify
-#define ESP2_UART_RX        PD_6    // TODO: verify
+#define ESP2_UART_TX        PA_2    
+#define ESP2_UART_RX        PA_3   
 
 // ESP32 Node 3 — USART6
 #define ESP3_UART_TX        PC_6    // !! CONFLICT if also used for RF_SWITCH_CTRL !!
 #define ESP3_UART_RX        PC_7    // TODO: verify
 
 // ESP32 Node 4 — UART4
-#define ESP4_UART_TX        PD_1    // TODO: verify
-#define ESP4_UART_RX        PD_0    // TODO: verify
+#define ESP4_UART_TX        PA_0  // TODO: verify
+#define ESP4_UART_RX        PA_1 // TODO: verify
 
 // ESP32 Node 5 — UART5
-#define ESP5_UART_TX        PC_12   // TODO: verify
-#define ESP5_UART_RX        PD_2    // TODO: verify
+#define ESP5_UART_TX        PB_13 //ODO: verify
+#define ESP5_UART_RX        PB_12
 
 // ESP32 Node 6 — UART7
-#define ESP6_UART_TX        PE_8    // TODO: verify
-#define ESP6_UART_RX        PE_7    // TODO: verify
+#define ESP6_UART_TX        PF_7
+#define ESP6_UART_RX        PF_6               
 
 // ESP32 Node 7 — UART8
 //  ** PE1 (only TX option) is hardwired to LD2 on Nucleo **
@@ -99,10 +109,10 @@
 #define ESP7_UART_RX        PE_0    // TODO: verify
 
 // ESP32 Node 8 — LPUART1
-#define ESP8_UART_TX        PB_6    // !! CONFLICT if also used for NRF24_CS !!
-#define ESP8_UART_RX        PB_7    // !! CONFLICT if also used for NRF24_CE !!
+#define ESP8_UART_TX        PA_9
+#define ESP8_UART_RX        PA_10
 
-// ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
 //  Sync pulse GPIO (optional)
 //  If using a dedicated GPIO for "take measurement now" sync
 //  to all ESP32s (separate from nRF24 channel), define here.
