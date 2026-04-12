@@ -8,17 +8,28 @@
  *    - 8x ESP32-S3 sensor nodes (UART)
  *    - 1x nRF24L01+ CW reference transmitter (SPI)
  *    - 8x BGS12WN6 RF switches (shared CTRL GPIO)
- *    - Boot-time diagnostics over ST-Link VCP
+ *    - Boot-time diagnostics over ST-Link VCP (USART3)
  *
- *  Calibration sequence (runs once at boot):
- *    1. RF switches → reference path (nRF trace)
- *    2. nRF24 transmits packets at 2437 MHz (= WiFi ch 6)
- *       through the Wilkinson trace to every ESP32 antenna input
- *    3. Each ESP32 measures the phase of that arriving signal
- *       and reports it back over UART
- *    4. Nucleo averages CAL_SAMPLES readings per node (circular mean)
- *    5. Correction vector built: correction[i] = phase[0] - phase[i]
- *    6. RF switches → antenna path, normal operation resumes
+ *  Boot sequence:
+ *    1. Initialize debug serial, RF switch, nRF24, ESP32 UARTs
+ *    2. Run one-shot calibration (nRF reference → phase correction vector)
+ *    3. Enter command loop
+ *
+ *  Serial commands (type over ST-Link VCP, 115200 baud):
+ *    run    - start streaming binary host packets to PC
+ *    stop   - stop streaming, return to text debug mode
+ *    cal    - re-run calibration (stops/restarts streaming automatically)
+ *    status - print boot diagnostics and correction vector
+ *    ant    - force RF switches to antenna path
+ *    nrf    - test nRF24 chip connection
+ *
+ *  Host packet format (41 bytes, binary, sent during "run" mode):
+ *    [0]      SYNC_A     0xBB
+ *    [1]      SYNC_B     0xCC
+ *    [2..3]   seq        uint16 LE  (wraps at 65535)
+ *    [4..7]   timestamp  uint32 LE  (Nucleo millis())
+ *    [8..39]  phases[8]  float32 LE each  (corrected phase, radians)
+ *    [40]     checksum   XOR of bytes [0..39]
  *
  *  Pin assignments: see pinconfig.h
  */
@@ -41,10 +52,37 @@ RF24 radio(NRF24_CE_PIN, NRF24_CS_PIN);
 #define CAL_SAMPLES      20     // phase measurements averaged per node
 #define CAL_TIMEOUT_MS  500     // max wait for one packet per sample attempt (ms)
 
-// Calibration results — populated once by runCalibration()
-// Apply to every measurement: corrected_phase = raw_phase + phaseCorrection[node]
 static float phaseCorrection[NUM_ESP_NODES] = {0.0f};
 static bool  calDone = false;
+
+// ──────────────────────────────────────────────────────────
+//  Non-blocking per-node ESP32 UART parser
+//
+//  Each node streams 11-byte packets at up to ~100 Hz.
+//  The parser accumulates bytes one at a time so the main loop
+//  never blocks waiting for a full packet.
+// ──────────────────────────────────────────────────────────
+struct NodeParser {
+    uint8_t  buf[PACKET_SIZE];
+    int      count;     // bytes buffered (0 = hunting for sync)
+    bool     has_data;  // true when a validated packet is ready
+    float    phase;     // most recent validated phase (raw, uncorrected)
+};
+static NodeParser parsers[NUM_ESP_NODES];
+
+// ──────────────────────────────────────────────────────────
+//  Snapshot / streaming state
+//
+//  A "snapshot" is one phase reading per node assembled into a
+//  single host packet.  We send one snapshot per collection window:
+//  either when all 8 nodes have reported fresh data, or after
+//  SNAP_TIMEOUT_MS from the previous snapshot (whichever comes first).
+// ──────────────────────────────────────────────────────────
+static float    snapPhase[NUM_ESP_NODES];   // corrected phases for current snapshot
+static bool     snapFresh[NUM_ESP_NODES];   // which nodes have new data this window
+static uint32_t lastSnapTime = 0;
+static uint16_t snapSeq      = 0;
+static bool     streaming    = false;
 
 // ──────────────────────────────────────────────────────────
 //  Forward declarations
@@ -57,6 +95,9 @@ bool testNRF24Link();
 void setRFSwitch(bool toReference);
 bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t timeoutMs);
 void runCalibration();
+void feedParsers();
+void tryEmitSnapshot();
+void sendHostPacket();
 void printBootBanner();
 void printBootDiagnostics();
 
@@ -94,83 +135,224 @@ struct BootStatus {
 // ══════════════════════════════════════════════════════════
 void setup() {
     memset(&bootStatus, 0, sizeof(bootStatus));
+    memset(parsers,     0, sizeof(parsers));
+    memset(snapFresh,   0, sizeof(snapFresh));
+    memset(snapPhase,   0, sizeof(snapPhase));
     uint32_t bootStart = millis();
 
-    // 1. Debug serial
     initDebugSerial();
     printBootBanner();
 
-    // 2. RF switch GPIO
     Serial.println("[BOOT] Initializing RF switch CTRL...");
     initRFSwitchGPIO();
 
-    // 3. nRF24L01+ via RF24 library
     Serial.println("[BOOT] Initializing nRF24L01+...");
     initNRF24();
 
-    // 4. nRF24 link test
     Serial.println("[BOOT] Testing nRF24L01+ link...");
     bootStatus.nrf24Link = testNRF24Link();
 
-    // 5. ESP32 UART channels
     Serial.println("[BOOT] Initializing ESP32 UART channels...");
     initESP32UARTs();
 
-    // 6. Default RF path: antenna
     setRFSwitch(false);
     Serial.println("[BOOT] RF switches → ANTENNA path");
 
-    // 7. One-shot calibration via nRF reference trace
     runCalibration();
 
     bootStatus.bootTimeMs = millis() - bootStart;
     printBootDiagnostics();
-    Serial.println("[BOOT] === System ready ===\n");
+    Serial.println("[BOOT] === System ready ===");
+    Serial.println("  Type 'run' to begin streaming, 'stop' to halt, 'help' for all commands.\n");
 }
 
 // ══════════════════════════════════════════════════════════
 //  LOOP
 // ══════════════════════════════════════════════════════════
 void loop() {
-    // Echo ESP32 UART traffic to debug console
-    for (int i = 0; i < NUM_ESP_NODES; i++) {
-        if (espSerials[i]->available()) {
-            Serial.print("[ESP");
-            Serial.print(i + 1);
-            Serial.print("] ");
-            while (espSerials[i]->available()) {
-                Serial.write(espSerials[i]->read());
-            }
-            Serial.println();
-        }
+    // ── 1. Feed bytes from all ESP32 UARTs into per-node parsers ──────────────
+    feedParsers();
+
+    // ── 2. Snapshot assembly + host packet emission (streaming mode) ──────────
+    if (streaming) {
+        tryEmitSnapshot();
     }
 
-    // Debug serial command parser
+    // ── 3. Serial command parser ──────────────────────────────────────────────
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
 
-        if (cmd == "status") {
-            printBootDiagnostics();
+        if (cmd == "run") {
+            memset(parsers,   0, sizeof(parsers));
+            memset(snapFresh, 0, sizeof(snapFresh));
+            lastSnapTime = millis();
+            streaming = true;
+            Serial.println("[CMD] Streaming ON — sending binary host packets");
+
+        } else if (cmd == "stop") {
+            streaming = false;
+            Serial.println("[CMD] Streaming OFF");
+
         } else if (cmd == "cal") {
+            bool wasStreaming = streaming;
+            streaming = false;
             runCalibration();
+            if (wasStreaming) {
+                memset(parsers,   0, sizeof(parsers));
+                memset(snapFresh, 0, sizeof(snapFresh));
+                lastSnapTime = millis();
+                streaming = true;
+                Serial.println("[CMD] Streaming resumed after cal");
+            }
+
+        } else if (cmd == "status") {
+            printBootDiagnostics();
+
         } else if (cmd == "ant") {
             setRFSwitch(false);
             Serial.println("[CMD] RF → ANTENNA path");
+
         } else if (cmd == "nrf") {
             Serial.print("[CMD] nRF24 link: ");
             Serial.println(testNRF24Link() ? "PASS" : "FAIL");
+
+        } else if (cmd == "help" || cmd == "?") {
+            Serial.println("Commands: run | stop | cal | status | ant | nrf");
+
         } else if (cmd.length() > 0) {
-            Serial.print("[CMD] Unknown: ");
-            Serial.println(cmd);
-            Serial.println("  Commands: status, cal, ant, nrf");
+            Serial.print("[CMD] Unknown: '");
+            Serial.print(cmd);
+            Serial.println("'  — type 'help' for commands");
         }
     }
 }
 
 // ──────────────────────────────────────────────────────────
-//  Init helpers
+//  feedParsers — non-blocking per-node byte accumulator
+//
+//  Reads all bytes currently available on each ESP32 UART.
+//  Hunts for the 0xAA sync byte, then accumulates PACKET_SIZE-1
+//  more bytes.  On a complete packet, validates the XOR checksum
+//  and stores the phase in parsers[i].phase / .has_data.
+//
+//  Never blocks — returns immediately if no bytes are waiting.
 // ──────────────────────────────────────────────────────────
+void feedParsers()
+{
+    for (int i = 0; i < NUM_ESP_NODES; i++) {
+        while (espSerials[i]->available()) {
+            uint8_t b = (uint8_t)espSerials[i]->read();
+            NodeParser& p = parsers[i];
+
+            if (p.count == 0) {
+                // Hunting for sync byte
+                if (b == SYNC_BYTE) {
+                    p.buf[0] = b;
+                    p.count  = 1;
+                }
+            } else {
+                p.buf[p.count++] = b;
+                if (p.count == PACKET_SIZE) {
+                    p.count = 0;  // ready for next packet regardless of outcome
+
+                    // Validate XOR checksum over all 11 bytes (last byte is chk)
+                    uint8_t chk = 0;
+                    for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= p.buf[j];
+                    if (chk == p.buf[PACKET_SIZE - 1]) {
+                        // Extract phase from bytes [6..9]
+                        memcpy(&p.phase, &p.buf[6], sizeof(float));
+                        p.has_data = true;
+                    }
+                    // Bad checksum: silently drop and re-hunt
+                }
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────
+//  tryEmitSnapshot — assemble one host packet per window
+//
+//  Harvests fresh phases from completed parsers, applies
+//  calibration correction, then emits a host packet when either:
+//    a) all 8 nodes have fresh data, or
+//    b) SNAP_TIMEOUT_MS has elapsed and at least one node reported.
+//
+//  Nodes that did not report in this window keep their previous
+//  corrected phase value (stale but better than NaN for MUSIC).
+// ──────────────────────────────────────────────────────────
+void tryEmitSnapshot()
+{
+    // Harvest any fresh parser results
+    for (int i = 0; i < NUM_ESP_NODES; i++) {
+        if (parsers[i].has_data) {
+            snapPhase[i]        = parsers[i].phase + phaseCorrection[i];
+            snapFresh[i]        = true;
+            parsers[i].has_data = false;
+        }
+    }
+
+    bool allFresh = true;
+    bool anyFresh = false;
+    for (int i = 0; i < NUM_ESP_NODES; i++) {
+        if (!snapFresh[i]) allFresh = false;
+        if (snapFresh[i])  anyFresh = true;
+    }
+
+    bool timedOut = (millis() - lastSnapTime) >= SNAP_TIMEOUT_MS;
+
+    if (allFresh || (anyFresh && timedOut)) {
+        sendHostPacket();
+        memset(snapFresh, false, sizeof(snapFresh));
+        lastSnapTime = millis();
+    }
+}
+
+// ──────────────────────────────────────────────────────────
+//  sendHostPacket — emit one 41-byte binary frame over Serial
+//
+//  Format:
+//    [0]      0xBB        sync A
+//    [1]      0xCC        sync B
+//    [2..3]   seq         uint16 LE
+//    [4..7]   timestamp   uint32 LE  (Nucleo millis)
+//    [8..39]  phases[8]   float32 LE each (calibration-corrected)
+//    [40]     checksum    XOR of bytes [0..39]
+// ──────────────────────────────────────────────────────────
+void sendHostPacket()
+{
+    uint8_t  pkt[HOST_PKT_SIZE];
+    uint32_t ts = millis();
+
+    pkt[0] = HOST_SYNC_A;
+    pkt[1] = HOST_SYNC_B;
+    pkt[2] = (uint8_t)( snapSeq        & 0xFF);
+    pkt[3] = (uint8_t)((snapSeq >> 8)  & 0xFF);
+    pkt[4] = (uint8_t)( ts             & 0xFF);
+    pkt[5] = (uint8_t)((ts >>  8)      & 0xFF);
+    pkt[6] = (uint8_t)((ts >> 16)      & 0xFF);
+    pkt[7] = (uint8_t)((ts >> 24)      & 0xFF);
+
+    for (int i = 0; i < NUM_ESP_NODES; i++) {
+        uint8_t* fb = (uint8_t*)&snapPhase[i];
+        pkt[8 + i*4 + 0] = fb[0];
+        pkt[8 + i*4 + 1] = fb[1];
+        pkt[8 + i*4 + 2] = fb[2];
+        pkt[8 + i*4 + 3] = fb[3];
+    }
+
+    uint8_t chk = 0;
+    for (int i = 0; i < HOST_PKT_SIZE - 1; i++) chk ^= pkt[i];
+    pkt[HOST_PKT_SIZE - 1] = chk;
+
+    Serial.write(pkt, HOST_PKT_SIZE);
+    snapSeq++;
+}
+
+// ══════════════════════════════════════════════════════════
+//  Init helpers
+// ══════════════════════════════════════════════════════════
 
 void initDebugSerial() {
     Serial.begin(DEBUG_BAUD);
@@ -181,9 +363,9 @@ void initDebugSerial() {
 
 void initRFSwitchGPIO() {
     // Single GPIO drives all 8 BGS12WN6 CTRL pins simultaneously —
-    // guarantees phase-coherent simultaneous switching across all nodes.
+    // guarantees phase-coherent simultaneous switching.
     // CTRL=LOW  → RF1 (antenna path)
-    // CTRL=HIGH → RF2 (reference/calibration path via Wilkinson combiner)
+    // CTRL=HIGH → RF2 (calibration path via Wilkinson combiner)
     pinMode(RF_SWITCH_CTRL_PIN, OUTPUT);
     digitalWrite(RF_SWITCH_CTRL_PIN, LOW);
     bootStatus.rfSwitch = true;
@@ -195,14 +377,13 @@ void initNRF24() {
         bootStatus.nrf24 = false;
         return;
     }
-    // Match ESP32 WiFi channel: nRF channel N = (2400+N) MHz
-    // WiFi ch 6 = 2437 MHz → nRF channel 37
-    radio.setPALevel(RF24_PA_MAX);       // maximum power through trace
-    radio.setDataRate(RF24_250KBPS);     // lowest rate = cleanest signal
+    // nRF channel N = (2400+N) MHz  →  WiFi ch 6 (2437 MHz) = nRF ch 37
+    radio.setPALevel(RF24_PA_MAX);
+    radio.setDataRate(RF24_250KBPS);
     radio.setChannel(NRF24_WIFI_CHANNEL);
-    radio.stopListening();               // TX mode
+    radio.stopListening();
     bootStatus.nrf24 = true;
-    Serial.printf("  nRF24 ready: ch=%d (%.0f MHz), rate=250kbps, PA=MAX\n",
+    Serial.printf("  nRF24 ready: ch=%d (%.0f MHz), 250kbps, PA=MAX\n",
                   NRF24_WIFI_CHANNEL, 2400.0f + NRF24_WIFI_CHANNEL);
 }
 
@@ -225,13 +406,8 @@ void setRFSwitch(bool toReference) {
 }
 
 // ──────────────────────────────────────────────────────────
-//  CSI packet parser
+//  readCSIPacket — blocking single-packet read (used only during calibration)
 // ──────────────────────────────────────────────────────────
-
-// Reads one 11-byte binary CSI packet from a node UART.
-// Hunts for the 0xAA sync byte, reads the remaining 10 bytes,
-// validates the XOR checksum, extracts nodeId and phase.
-// Returns true on success, false on timeout or bad checksum.
 bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t timeoutMs)
 {
     uint32_t deadline = millis() + timeoutMs;
@@ -239,24 +415,20 @@ bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t 
     while (millis() < deadline)
     {
         if (!ser->available()) continue;
-        if (ser->read() != SYNC_BYTE) continue;  // hunt for sync
+        if (ser->read() != SYNC_BYTE) continue;
 
-        // Read remaining 10 bytes with a short inner timeout
         uint8_t buf[PACKET_SIZE - 1];
         uint32_t inner = millis() + 50;
         int n = 0;
-        while (n < PACKET_SIZE - 1 && millis() < inner) {
+        while (n < PACKET_SIZE - 1 && millis() < inner)
             if (ser->available()) buf[n++] = ser->read();
-        }
-        if (n < PACKET_SIZE - 1) continue;  // incomplete — resync
+        if (n < PACKET_SIZE - 1) continue;
 
-        // XOR of all 11 bytes (incl. sync byte already consumed) must be 0
         uint8_t chk = SYNC_BYTE;
         for (int i = 0; i < PACKET_SIZE - 2; i++) chk ^= buf[i];
-        if (chk != buf[PACKET_SIZE - 2]) continue;  // bad checksum — resync
+        if (chk != buf[PACKET_SIZE - 2]) continue;
 
         *nodeId = buf[0];
-        // buf[1..4] = timestamp (not used during calibration)
         memcpy(phase, &buf[5], sizeof(float));
         return true;
     }
@@ -264,46 +436,34 @@ bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t 
 }
 
 // ──────────────────────────────────────────────────────────
-//  Calibration
+//  runCalibration
+//
+//  Transmits nRF reference packets through the Wilkinson trace
+//  to all ESP32 antenna inputs simultaneously.  Each node
+//  measures phase of the arriving signal.  Circular mean per node
+//  avoids wrap-around artefacts at ±π.
+//
+//  Result: phaseCorrection[i] = meanPhase[0] - meanPhase[i]
+//  Apply during normal operation: corrected = raw + phaseCorrection[i]
 // ──────────────────────────────────────────────────────────
-
-// Runs once at boot (and again if 'cal' is typed over serial).
-//
-// The nRF24 transmits a 2.4 GHz signal through the Wilkinson trace
-// to every ESP32 antenna input simultaneously.  Each node measures
-// the phase of that arriving signal and reports it over UART.
-// Because all nodes receive the SAME physical signal through a FIXED
-// trace, any phase difference between node i and node 0 is purely
-// a hardware offset (trace length, component tolerances) that must
-// be removed before MUSIC can work correctly.
-//
-// Correction applied during normal operation:
-//   corrected_phase[i] = raw_phase[i] + phaseCorrection[i]
 void runCalibration()
 {
     Serial.println("[CAL] ── Calibration start ──────────────────");
 
     if (!bootStatus.nrf24) {
-        Serial.println("[CAL] ERROR: nRF24 not ready — skipping");
+        Serial.println("[CAL] ERROR: nRF24 not ready — skipping calibration");
         return;
     }
 
-    // Switch all RF paths to the reference trace
     Serial.println("[CAL] RF switches → REFERENCE path (nRF trace)");
     setRFSwitch(true);
-    delay(50);  // switch + nRF PLL settle time
+    delay(50);
 
-    // Open TX pipe and ensure radio is transmitting
     radio.openWritingPipe((const uint8_t*)NRF24_CAL_ADDRESS);
     radio.stopListening();
 
-    // Calibration payload — content is irrelevant, just needs to be
-    // non-zero so the nRF hardware actually modulates the carrier
     uint8_t calPayload[4] = {0xCA, 0x1B, 0x00, 0x00};
 
-    // Circular-mean accumulators per node
-    // Uses sum-of-sin / sum-of-cos rather than arithmetic mean to
-    // correctly handle phase wrap-around at ±π
     double sinSum[NUM_ESP_NODES] = {};
     double cosSum[NUM_ESP_NODES] = {};
     int    count[NUM_ESP_NODES]  = {};
@@ -316,37 +476,30 @@ void runCalibration()
 
         for (int s = 0; s < CAL_SAMPLES; s++)
         {
-            // Fire one reference packet through the trace before each read
             calPayload[2] = (uint8_t)node;
             calPayload[3] = (uint8_t)s;
             radio.write(calPayload, sizeof(calPayload));
 
             uint8_t rxId;
             float   rxPhase;
-            if (readCSIPacket(espSerials[node], &rxId, &rxPhase, CAL_TIMEOUT_MS))
-            {
+            if (readCSIPacket(espSerials[node], &rxId, &rxPhase, CAL_TIMEOUT_MS)) {
                 sinSum[node] += sin((double)rxPhase);
                 cosSum[node] += cos((double)rxPhase);
                 count[node]++;
                 Serial.print(".");
-            }
-            else
-            {
-                Serial.print("x");  // timeout — node not responding
+            } else {
+                Serial.print("x");
             }
         }
         Serial.printf("  (%d/%d)\n", count[node], CAL_SAMPLES);
     }
 
-    // Done transmitting — power down nRF and return to antenna path
     radio.powerDown();
     setRFSwitch(false);
     Serial.println("[CAL] nRF powered down, RF switches → ANTENNA path");
 
-    // Compute circular mean phase per node
     float meanPhase[NUM_ESP_NODES] = {};
-    for (int node = 0; node < NUM_ESP_NODES; node++)
-    {
+    for (int node = 0; node < NUM_ESP_NODES; node++) {
         if (count[node] > 0) {
             meanPhase[node] = (float)atan2(
                 sinSum[node] / count[node],
@@ -357,12 +510,8 @@ void runCalibration()
         }
     }
 
-    // Build correction vector: correction[i] = phase[0] - phase[i]
-    // After applying correction, all nodes are phase-aligned to node 0.
-    // Node 0 correction is always 0 by definition.
     Serial.println("[CAL] Correction vector (node 0 = reference):");
-    for (int node = 0; node < NUM_ESP_NODES; node++)
-    {
+    for (int node = 0; node < NUM_ESP_NODES; node++) {
         phaseCorrection[node] = meanPhase[0] - meanPhase[node];
         Serial.printf("[CAL]   Node %d  mean=% .4f rad  correction=% .4f rad\n",
                       node, meanPhase[node], phaseCorrection[node]);
@@ -389,21 +538,20 @@ void printBootBanner() {
 void printBootDiagnostics() {
     Serial.println();
     Serial.println("─── Boot Diagnostics ───────────────────────");
-    Serial.print("  Debug Serial (USART3 VCP) : "); Serial.println(bootStatus.debugSerial ? "OK" : "FAIL");
-    Serial.print("  RF Switch CTRL GPIO       : "); Serial.println(bootStatus.rfSwitch    ? "OK" : "FAIL");
-    Serial.print("  nRF24L01+                 : "); Serial.println(bootStatus.nrf24       ? "OK" : "FAIL");
+    Serial.print("  Debug Serial (USART3 VCP) : "); Serial.println(bootStatus.debugSerial ? "OK"   : "FAIL");
+    Serial.print("  RF Switch CTRL GPIO       : "); Serial.println(bootStatus.rfSwitch    ? "OK"   : "FAIL");
+    Serial.print("  nRF24L01+                 : "); Serial.println(bootStatus.nrf24       ? "OK"   : "FAIL");
     Serial.print("  nRF24L01+ link test       : "); Serial.println(bootStatus.nrf24Link   ? "PASS" : "FAIL");
     Serial.print("  Calibration               : "); Serial.println(calDone                ? "DONE" : "NOT RUN");
+    Serial.print("  Streaming                 : "); Serial.println(streaming              ? "ON"   : "OFF");
     if (calDone) {
         Serial.println("  Correction vector:");
-        for (int i = 0; i < NUM_ESP_NODES; i++) {
+        for (int i = 0; i < NUM_ESP_NODES; i++)
             Serial.printf("    Node %d: % .4f rad\n", i, phaseCorrection[i]);
-        }
     }
     Serial.println("  ESP32 UART channels:");
-    for (int i = 0; i < NUM_ESP_NODES; i++) {
+    for (int i = 0; i < NUM_ESP_NODES; i++)
         Serial.printf("    Node %d : %s\n", i + 1, bootStatus.espUarts[i] ? "OK" : "FAIL");
-    }
     Serial.printf("  Boot time: %lu ms\n", bootStatus.bootTimeMs);
     Serial.println("────────────────────────────────────────────");
     Serial.println();

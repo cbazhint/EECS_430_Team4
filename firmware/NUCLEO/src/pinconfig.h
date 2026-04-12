@@ -25,7 +25,16 @@
 
 // CSI packet protocol (must match ESP32 firmware)
 #define SYNC_BYTE           0xAA
-#define PACKET_SIZE         11       // bytes per CSI packet
+#define PACKET_SIZE         11       // bytes per ESP→Nucleo CSI packet
+
+// Host packet protocol (Nucleo → PC over ST-Link VCP)
+// 41 bytes: [0xBB][0xCC][seq u16 LE][ts u32 LE][phase×8 f32 LE][XOR chk]
+#define HOST_SYNC_A         0xBB
+#define HOST_SYNC_B         0xCC
+#define HOST_PKT_SIZE       41
+
+// Snapshot assembly window — send after this many ms even if not all nodes reported
+#define SNAP_TIMEOUT_MS     50
 
 // nRF24L01+ calibration channel
 // nRF channel N = (2400 + N) MHz → WiFi ch 6 (2437 MHz) = nRF ch 37
