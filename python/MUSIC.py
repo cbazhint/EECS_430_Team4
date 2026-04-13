@@ -96,9 +96,10 @@ from collections import deque
 
 import numpy as np
 import matplotlib
-import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.animation import FuncAnimation
+# matplotlib.pyplot is imported lazily inside launch_display() after
+# _setup_backend() selects an interactive backend. Importing pyplot at
+# module level would lock in the default (Agg) backend before we can change it.
 
 # ── Array parameters ──────────────────────────────────────────────────────────
 Nx = 2      # azimuth columns
@@ -351,11 +352,55 @@ def simulate_snapshots(processor, theta_deg, phi_deg, snr_db, stop_event):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Backend detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _setup_backend(args):
+    """
+    Select an interactive matplotlib backend BEFORE pyplot is imported.
+
+    Must be called once, before any `import matplotlib.pyplot` statement.
+    If no interactive backend can be found (e.g. WSL2 without a display),
+    automatically enables --save mode and falls back to Agg.
+
+    Returns True if an interactive display is available.
+    """
+    if args.save:
+        matplotlib.use('Agg')
+        return False
+
+    # Manual override
+    if hasattr(args, 'backend') and args.backend:
+        matplotlib.use(args.backend)
+        return True
+
+    # Auto-detect: try interactive backends in preference order
+    for backend in ('TkAgg', 'Qt5Agg', 'wxAgg', 'MacOSX'):
+        try:
+            matplotlib.use(backend)
+            import matplotlib.pyplot as _plt
+            _plt.figure()
+            _plt.close('all')
+            return True
+        except Exception:
+            pass
+
+    # No interactive backend found — fall back to headless save mode
+    matplotlib.use('Agg')
+    print("[display] No interactive display found — switching to --save mode automatically.")
+    print("          On WSL2: install WSLg or start an X server (e.g. VcXsrv).")
+    print("          Frames will be saved as music_frame_NNNN.png\n")
+    args.save = True
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Live display
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_figure(n_scan, vmin_db):
     """Create the matplotlib figure and return handles needed for animation."""
+    import matplotlib.pyplot as plt  # backend must already be set by _setup_backend()
     fig, axes = plt.subplots(1, 2, figsize=(13, 6),
                              gridspec_kw={'width_ratios': [3, 1]})
     fig.patch.set_facecolor('#1a1a2e')
@@ -488,13 +533,17 @@ def _apply_result(result, im, peak_dot, title_obj, info_text, args):
 
 
 def launch_display(processor, args, stop_event):
-    """Set up matplotlib and start the animation loop (runs in main thread)."""
+    """Set up matplotlib backend, build the figure, and run the update loop."""
+    # Backend must be selected before pyplot is imported anywhere.
+    # _setup_backend() may flip args.save=True if no display is found.
+    _setup_backend(args)
+    import matplotlib.pyplot as plt   # safe to import now
+
     fig, im, peak_dot, title_obj, info_text = build_figure(args.scan, args.vmin)
 
     if args.save:
         # ── Headless save mode: manual loop, no GUI needed ────────────────────
         print("[display] Save mode — frames written to music_frame_NNNN.png")
-        matplotlib.use('Agg')   # ensure non-interactive backend
         frame = 0
         try:
             while not stop_event.is_set():
@@ -514,18 +563,22 @@ def launch_display(processor, args, stop_event):
             stop_event.set()
     else:
         # ── Interactive live display ───────────────────────────────────────────
-        def _update(_frame):
-            result = processor.get_result()
-            _apply_result(result, im, peak_dot, title_obj, info_text, args)
-            return im, peak_dot, title_obj, info_text
-
-        ani = FuncAnimation(  # noqa: F841 — must stay alive
-            fig, _update, interval=200, blit=False, cache_frame_data=False)
+        # plt.ion() + plt.pause() is more reliable than FuncAnimation across
+        # backends: pause() pumps the GUI event loop and flushes draw_idle().
+        plt.ion()
+        plt.show(block=False)
         try:
-            plt.show(block=True)
+            while not stop_event.is_set():
+                result = processor.get_result()
+                _apply_result(result, im, peak_dot, title_obj, info_text, args)
+                fig.canvas.draw_idle()   # queue redraw
+                plt.pause(0.2)           # pump GUI event loop + execute redraw
+                if not plt.fignum_exists(fig.number):
+                    break                # user closed the window
         except KeyboardInterrupt:
             pass
         finally:
+            plt.close(fig)
             stop_event.set()
 
 
@@ -580,6 +633,8 @@ def parse_args():
                    help='Simulated SNR in dB (default: 20)')
     p.add_argument('--save',      action='store_true',
                    help='Save frames as PNGs instead of live display')
+    p.add_argument('--backend',   default=None,
+                   help='Matplotlib backend override, e.g. TkAgg, Qt5Agg, wxAgg')
     return p.parse_args()
 
 

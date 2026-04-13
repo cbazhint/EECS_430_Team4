@@ -1,0 +1,30 @@
+From the parse_args() section in MUSIC.py:
+
+Flag	Default	What it does
+--port PORT	/dev/ttyACM0	Serial port the Nucleo is connected to. Windows: COM5 etc.
+--baud BAUD	115200	Serial baud rate — must match Nucleo firmware
+--sources K	1	How many simultaneous signal sources MUSIC should look for. Must be less than 8. Raise to 2 or 3 if you expect multiple transmitters
+--snapshots N	64	Number of phase snapshots used to build the covariance matrix. More = smoother/more accurate but more lag. Minimum is 9
+--update N	16	Recompute MUSIC every N new snapshots. Lower = more frequent updates, higher CPU. At --snapshots 64 --update 16 you get a new result every ~16 packets
+--scan N	100	Resolution of the u-v search grid (N×N points). Higher = finer angular resolution but slower. 100 is a good balance
+--vmin DB	-30	Lower color limit of the heatmap in dB. Raise to -10 to suppress weak sidelobes, lower to -40 to see more detail
+--simulate	off	Skip hardware entirely — generates synthetic CSI data internally for testing
+--theta DEG	30	Simulated source elevation angle in degrees (only used with --simulate)
+--phi DEG	45	Simulated source azimuth angle in degrees (only used with --simulate)
+--snr DB	20	Simulated signal-to-noise ratio in dB (only used with --simulate)
+--save	off	Save frames as music_frame_NNNN.png instead of showing a live window
+--backend NAME	auto	Force a specific matplotlib backend, e.g. TkAgg, Qt5Agg. Skips auto-detection
+Common combinations:
+
+
+# Test algorithm, no hardware
+python MUSIC.py --simulate --theta 45 --phi 30 --snr 15
+
+# Low-end machine — smaller grid, less frequent updates
+python MUSIC.py --simulate --scan 60 --update 32
+
+# Multiple transmitters
+python MUSIC.py --sources 2
+
+# WSL2 after installing python3-tk
+python MUSIC.py --backend TkAgg --simulate
