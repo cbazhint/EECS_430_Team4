@@ -11,9 +11,16 @@ def steering_vector_2d(phi, theta, Nx, Ny, d=0.5):
 
 
 # ── Array parameters ──────────────────────────────────────────────────────────
-Nx = 8   # columns (azimuth,  x-direction, cos(phi))
-Ny = 2   # rows    (elevation, y-direction, sin(phi))
-Nr = Nx * Ny   # 16 total elements
+# 2x4 planar array: 2 columns along azimuth (x), 4 rows along elevation (y)
+# Node numbering (kron ordering, index = col*Ny + row):
+#   col:  0    1
+# row 0: [0]  [4]
+# row 1: [1]  [5]
+# row 2: [2]  [6]
+# row 3: [3]  [7]
+Nx = 2   # columns (azimuth,  x-direction)
+Ny = 4   # rows    (elevation, y-direction)
+Nr = Nx * Ny   # 8 total elements
 d  = 0.5
 N  = 1000
 

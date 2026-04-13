@@ -34,7 +34,7 @@
 /* ============================================================
    CONFIGURATION - adjust per node before flashing
    ============================================================ */
-#define NODE_ID             0
+#define NODE_ID             4
 #define UART_TX_PIN         17
 #define UART_RX_PIN         18
 #define UART_BAUD           921600
