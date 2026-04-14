@@ -96,16 +96,16 @@
 #define ESP2_UART_RX        PA_3   
 
 // ESP32 Node 3 — USART6
-#define ESP3_UART_TX        PC_6    // !! CONFLICT if also used for RF_SWITCH_CTRL !!
-#define ESP3_UART_RX        PC_7    // TODO: verify
+#define ESP3_UART_TX        PA_1    // !! CONFLICT if also used for RF_SWITCH_CTRL !!
+#define ESP3_UART_RX        PA_0    // TODO: verify
 
 // ESP32 Node 4 — UART4
-#define ESP4_UART_TX        PA_0  // TODO: verify
-#define ESP4_UART_RX        PA_1 // TODO: verify
+#define ESP4_UART_TX        PB_13  // TODO: verify
+#define ESP4_UART_RX        PB_12 // TODO: verify
 
 // ESP32 Node 5 — UART5
-#define ESP5_UART_TX        PB_13 //ODO: verify
-#define ESP5_UART_RX        PB_12
+#define ESP5_UART_TX        PC_6 //ODO: verify
+#define ESP5_UART_RX        PC_7
 
 // ESP32 Node 6 — UART7
 #define ESP6_UART_TX        PF_7
