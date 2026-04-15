@@ -43,6 +43,8 @@
 
 // ──────────────────────────────────────────────────────────
 //  nRF24L01+ radio  (CE pin, CSN pin)
+//  SPI pins are remapped to SPI3 in initNRF24() via SPI.setMOSI/MISO/SCLK
+//  STM32 core auto-selects SPI3 peripheral from pin AF lookup
 // ──────────────────────────────────────────────────────────
 RF24 radio(NRF24_CE_PIN, NRF24_CS_PIN);
 
@@ -158,7 +160,7 @@ void setup() {
     setRFSwitch(false);
     Serial.println("[BOOT] RF switches → ANTENNA path");
 
-    runCalibration();
+    //runCalibration();
 
     bootStatus.bootTimeMs = millis() - bootStart;
     printBootDiagnostics();
@@ -240,9 +242,13 @@ void loop() {
 // ──────────────────────────────────────────────────────────
 void feedParsers()
 {
+    static uint32_t lastDiag  = 0;
+    static uint32_t bytesRx[NUM_ESP_NODES] = {};
+
     for (int i = 0; i < NUM_ESP_NODES; i++) {
         while (espSerials[i]->available()) {
             uint8_t b = (uint8_t)espSerials[i]->read();
+            bytesRx[i]++;
             NodeParser& p = parsers[i];
 
             if (p.count == 0) {
@@ -268,6 +274,16 @@ void feedParsers()
                 }
             }
         }
+    }
+
+    // Print byte counts every 5 s so we can confirm wiring without a scope
+    if (millis() - lastDiag >= 5000) {
+        lastDiag = millis();
+        Serial.print("[UART rx bytes]");
+        for (int i = 0; i < NUM_ESP_NODES; i++) {
+            Serial.printf("  U%d:%lu", i + 1, bytesRx[i]);
+        }
+        Serial.println();
     }
 }
 
@@ -302,7 +318,10 @@ void tryEmitSnapshot()
 
     bool timedOut = (millis() - lastSnapTime) >= SNAP_TIMEOUT_MS;
 
-    if (allFresh || (anyFresh && timedOut)) {
+    // Send when all nodes fresh, or timeout with partial data, or keepalive
+    // when no ESP32s are connected (anyFresh=false) so Python pipeline can
+    // be tested before hardware is fully wired.
+    if (allFresh || timedOut) {
         sendHostPacket();
         memset(snapFresh, false, sizeof(snapFresh));
         lastSnapTime = millis();
@@ -356,8 +375,7 @@ void sendHostPacket()
 
 void initDebugSerial() {
     Serial.begin(DEBUG_BAUD);
-    uint32_t t0 = millis();
-    while (!Serial && (millis() - t0 < 2000)) {}
+    delay(100);   // let UART settle; no blocking wait on !Serial (USART3, not USB-CDC)
     bootStatus.debugSerial = true;
 }
 
@@ -372,6 +390,30 @@ void initRFSwitchGPIO() {
 }
 
 void initNRF24() {
+    Serial.println("I AM INITIALIZING!!!");
+    // Remap SPI1 to PB3/PB4/PB5 — avoids PA7 Ethernet conflict and PC10/PC11 SDMMC pull-downs
+    SPI.setMOSI(NRF24_MOSI_PIN);  // PB_5 → SPI1 MOSI
+    SPI.setMISO(NRF24_MISO_PIN);  // PB_4 → SPI1 MISO
+    SPI.setSCLK(NRF24_SCK_PIN);   // PB_3 → SPI1 SCK
+
+    // ── Raw SPI diagnostic — read nRF24 STATUS register directly ─────────────
+    // STATUS reg (addr 0x07) resets to 0x0E on a working chip.
+    // 0xFF = MISO floating (not connected)
+    // 0x00 = MISO pulled low (short or wrong pin)
+    // 0x0E = SPI working, chip alive
+    SPI.begin();
+    Serial.println("[nRF24] SPI.begin() returned (SPI3 pins)");
+    Serial.flush();
+    pinMode(NRF24_CS_PIN, OUTPUT);
+    digitalWrite(NRF24_CS_PIN, HIGH);
+    delay(5);
+    digitalWrite(NRF24_CS_PIN, LOW);
+    uint8_t spiStatus = SPI.transfer(0xFF);  // NOP command returns STATUS byte
+    digitalWrite(NRF24_CS_PIN, HIGH);
+    Serial.printf("[nRF24] Raw STATUS via SPI3: 0x%02X  (expect 0x0E)\n", spiStatus);
+    Serial.flush();
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (!radio.begin()) {
         Serial.println("[WARN] nRF24: radio.begin() failed — check wiring");
         bootStatus.nrf24 = false;

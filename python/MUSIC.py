@@ -592,12 +592,21 @@ def serial_bridge(ns, processor, stop_event):
     Runs in its own thread.
     """
     print("[bridge] Serial bridge started")
+    count = 0
+    last_report = time.time()
     while not stop_event.is_set():
         snap = ns.get_snapshot(timeout=0.1)
         if snap is None:
+            if time.time() - last_report > 5.0:
+                print(f"[bridge] Still waiting for packets... ({count} received so far)")
+                last_report = time.time()
             continue
         processor.push_snapshot(snap['phases'])
-    print("[bridge] Serial bridge stopped")
+        count += 1
+        if count <= 5 or count % 50 == 0:
+            print(f"[bridge] pkt #{count}  seq={snap['seq']}  phases={[f'{p:.2f}' for p in snap['phases']]}")
+        last_report = time.time()
+    print(f"[bridge] Serial bridge stopped. Total packets: {count}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -689,6 +698,8 @@ def main():
             from serialRead import NucleoSerial
             ns = NucleoSerial(port=args.port, baudrate=args.baud)
             ns.start()
+            print("[init] Waiting 2 s for Nucleo boot...")
+            time.sleep(2)
             ns.send_command('run')
             print("[init] Sent 'run' command to Nucleo — streaming started")
         except Exception as e:

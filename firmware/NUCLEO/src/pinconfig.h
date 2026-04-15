@@ -56,8 +56,11 @@
 //    MOSI = PA7  (CN7 pin 14, D11)  ** check SB31 for Ethernet conflict **
 //  CS and CE are generic GPIOs — pick two free pins
 // ──────────────────────────────────────────────────────────
-#define NRF24_CS_PIN        PG_7   
-#define NRF24_CE_PIN        PG_6    
+#define NRF24_CS_PIN        PG_7
+#define NRF24_CE_PIN        PG_6
+#define NRF24_SCK_PIN       PB_3   // SPI1 SCK
+#define NRF24_MISO_PIN      PB_4   // SPI1 MISO
+#define NRF24_MOSI_PIN      PB_5   // SPI1 MOSI
 
 // ──────────────────────────────────────────────────────────
 //  RF Switch — BGS12WN6 shared CTRL
@@ -100,8 +103,8 @@
 #define ESP3_UART_RX        PA_0    // TODO: verify
 
 // ESP32 Node 4 — UART4
-#define ESP4_UART_TX        PB_13  // TODO: verify
-#define ESP4_UART_RX        PB_12 // TODO: verify
+#define ESP4_UART_TX        PB_12  // TODO: verify
+#define ESP4_UART_RX        PB_13 // TODO: verify
 
 // ESP32 Node 5 — UART5
 #define ESP5_UART_TX        PC_6 //ODO: verify

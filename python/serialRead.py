@@ -180,6 +180,8 @@ class NucleoSerial:
 
     def __init__(self, port: str = PORT, baudrate: int = BAUDRATE):
         self.ser     = serial.Serial(port=port, baudrate=baudrate, timeout=TIMEOUT)
+        self.ser.dtr = False   # prevent DTR toggling from resetting the Nucleo on open
+        self.ser.rts = False
         self._queue  = queue.Queue()
         self._stop   = threading.Event()
         self._thread = threading.Thread(
@@ -240,6 +242,8 @@ if __name__ == '__main__':
     ns = NucleoSerial(port=port)
     ns.start()
 
+    print("Waiting 2 s for Nucleo to finish booting...")
+    time.sleep(2)
     print("Sending 'run' command...")
     ns.send_command('run')
     print("Listening for snapshots (Ctrl+C to stop)...\n")
