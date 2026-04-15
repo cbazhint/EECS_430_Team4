@@ -51,11 +51,14 @@ RF24 radio(NRF24_CE_PIN, NRF24_CS_PIN);
 // ──────────────────────────────────────────────────────────
 //  Calibration configuration
 // ──────────────────────────────────────────────────────────
-#define CAL_SAMPLES      20     // phase measurements averaged per node
-#define CAL_TIMEOUT_MS  500     // max wait for one packet per sample attempt (ms)
+#define CAL_SAMPLES          20    // phase measurements averaged per node
+#define CAL_TIMEOUT_MS      500    // max wait for one packet per sample attempt (ms)
+#define CAL_REFERENCE_NODE    1    // preferred reference node (falls back if no data)
+#define CAL_MIN_SAMPLES       5    // minimum samples to consider a node calibrated
 
-static float phaseCorrection[NUM_ESP_NODES] = {0.0f};
-static bool  calDone = false;
+static float   phaseCorrection[NUM_ESP_NODES] = {0.0f};
+static uint8_t calValid = 0x00;    // bitmask: bit i set = node i is calibrated
+static bool    calDone  = false;
 
 // ──────────────────────────────────────────────────────────
 //  Non-blocking per-node ESP32 UART parser
@@ -97,6 +100,7 @@ bool testNRF24Link();
 void setRFSwitch(bool toReference);
 bool readCSIPacket(HardwareSerial* ser, uint8_t* nodeId, float* phase, uint32_t timeoutMs);
 void runCalibration();
+void verifyCalibration();
 void feedParsers();
 void tryEmitSnapshot();
 void sendHostPacket();
@@ -211,6 +215,9 @@ void loop() {
         } else if (cmd == "status") {
             printBootDiagnostics();
 
+        } else if (cmd == "verify") {
+            verifyCalibration();
+
         } else if (cmd == "ant") {
             setRFSwitch(false);
             Serial.println("[CMD] RF → ANTENNA path");
@@ -220,7 +227,7 @@ void loop() {
             Serial.println(testNRF24Link() ? "PASS" : "FAIL");
 
         } else if (cmd == "help" || cmd == "?") {
-            Serial.println("Commands: run | stop | cal | status | ant | nrf");
+            Serial.println("Commands: run | stop | cal | verify | status | ant | nrf");
 
         } else if (cmd.length() > 0) {
             Serial.print("[CMD] Unknown: '");
@@ -361,6 +368,8 @@ void sendHostPacket()
         pkt[8 + i*4 + 3] = fb[3];
     }
 
+    pkt[40] = calValid;   // calibration validity bitmask — bit i = node i calibrated
+
     uint8_t chk = 0;
     for (int i = 0; i < HOST_PKT_SIZE - 1; i++) chk ^= pkt[i];
     pkt[HOST_PKT_SIZE - 1] = chk;
@@ -472,54 +481,259 @@ void runCalibration()
     double cosSum[NUM_ESP_NODES] = {};
     int    count[NUM_ESP_NODES]  = {};
 
-    Serial.printf("[CAL] Collecting %d samples per node...\n", CAL_SAMPLES);
+    // Poll all nodes simultaneously so no UART FIFO starves while waiting
+    // for another node.  At 100 Hz cal rate, CAL_SAMPLES×10ms per node = 200ms
+    // of useful data; give 3× headroom for slow nodes.
+    uint32_t calDeadline = millis() + (CAL_SAMPLES * 30UL * NUM_ESP_NODES);
 
-    for (int node = 0; node < NUM_ESP_NODES; node++)
+    // Local per-node packet parsers (independent of main feedParsers state)
+    struct { uint8_t buf[PACKET_SIZE]; int count; } cp[NUM_ESP_NODES];
+    memset(cp, 0, sizeof(cp));
+
+    Serial.printf("[CAL] Collecting %d samples per node (round-robin)...\n", CAL_SAMPLES);
+
+    while (millis() < calDeadline)
     {
-        Serial.printf("[CAL]   Node %d: ", node);
+        bool allDone = true;
+        for (int i = 0; i < NUM_ESP_NODES; i++)
+            if (count[i] < CAL_SAMPLES) { allDone = false; break; }
+        if (allDone) break;
 
-        for (int s = 0; s < CAL_SAMPLES; s++)
+        for (int i = 0; i < NUM_ESP_NODES; i++)
         {
-            // Cal ESP32 transmits at 100 Hz — just wait for sensor to report
-            uint8_t rxId;
-            float   rxPhase;
-            if (readCSIPacket(espSerials[node], &rxId, &rxPhase, CAL_TIMEOUT_MS)) {
-                sinSum[node] += sin((double)rxPhase);
-                cosSum[node] += cos((double)rxPhase);
-                count[node]++;
-                Serial.print(".");
-            } else {
-                Serial.print("x");
+            if (count[i] >= CAL_SAMPLES) continue;
+            while (espSerials[i]->available())
+            {
+                uint8_t b = (uint8_t)espSerials[i]->read();
+                if (cp[i].count == 0) {
+                    if (b == SYNC_BYTE) { cp[i].buf[0] = b; cp[i].count = 1; }
+                } else {
+                    cp[i].buf[cp[i].count++] = b;
+                    if (cp[i].count == PACKET_SIZE) {
+                        cp[i].count = 0;
+                        uint8_t chk = 0;
+                        for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= cp[i].buf[j];
+                        if (chk == cp[i].buf[PACKET_SIZE - 1]) {
+                            float raw;
+                            memcpy(&raw, &cp[i].buf[6], sizeof(float));
+                            sinSum[i] += sin((double)raw);
+                            cosSum[i] += cos((double)raw);
+                            count[i]++;
+                        }
+                    }
+                }
             }
         }
-        Serial.printf("  (%d/%d)\n", count[node], CAL_SAMPLES);
     }
 
-    // De-assert PF_1: RF switches back to antenna path, cal ESP32 drops to idle
-    setRFSwitch(false);
-    Serial.println("[CAL] RF switches → ANTENNA path, cal ESP32 → idle rate");
+    for (int node = 0; node < NUM_ESP_NODES; node++)
+        Serial.printf("[CAL]   Node %d: %d/%d\n", node, count[node], CAL_SAMPLES);
 
+    // ── Retry pass for nodes below minimum threshold ──────────────────────────
+    // RF switches are still HIGH — give struggling nodes one more window.
+    int failedCount = 0;
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        if (count[i] < CAL_MIN_SAMPLES) failedCount++;
+
+    if (failedCount > 0) {
+        Serial.printf("[CAL] %d node(s) below threshold (%d samples) — retry (2 s)...\n",
+                      failedCount, CAL_MIN_SAMPLES);
+
+        // Flush then collect for 2 more seconds, only targeting failed nodes
+        for (int i = 0; i < NUM_ESP_NODES; i++)
+            while (espSerials[i]->available()) espSerials[i]->read();
+        memset(cp, 0, sizeof(cp));
+
+        uint32_t retryDeadline = millis() + 2000;
+        while (millis() < retryDeadline) {
+            for (int i = 0; i < NUM_ESP_NODES; i++) {
+                if (count[i] >= CAL_MIN_SAMPLES) continue;
+                while (espSerials[i]->available()) {
+                    uint8_t b = (uint8_t)espSerials[i]->read();
+                    if (cp[i].count == 0) {
+                        if (b == SYNC_BYTE) { cp[i].buf[0] = b; cp[i].count = 1; }
+                    } else {
+                        cp[i].buf[cp[i].count++] = b;
+                        if (cp[i].count == PACKET_SIZE) {
+                            cp[i].count = 0;
+                            uint8_t chk = 0;
+                            for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= cp[i].buf[j];
+                            if (chk == cp[i].buf[PACKET_SIZE - 1]) {
+                                float raw;
+                                memcpy(&raw, &cp[i].buf[6], sizeof(float));
+                                sinSum[i] += sin((double)raw);
+                                cosSum[i] += cos((double)raw);
+                                count[i]++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Serial.println("[CAL] Retry results:");
+        for (int node = 0; node < NUM_ESP_NODES; node++)
+            if (count[node] < CAL_MIN_SAMPLES)
+                Serial.printf("[CAL]   Node %d: %d/%d  (still below threshold)\n",
+                              node, count[node], CAL_MIN_SAMPLES);
+    }
+
+    // De-assert PF_1: RF switches back to antenna path
+    setRFSwitch(false);
+    Serial.println("[CAL] RF switches → ANTENNA path");
+
+    // Pass 1: compute circular mean for nodes that received data
     float meanPhase[NUM_ESP_NODES] = {};
     for (int node = 0; node < NUM_ESP_NODES; node++) {
         if (count[node] > 0) {
             meanPhase[node] = (float)atan2(
                 sinSum[node] / count[node],
                 cosSum[node] / count[node]);
-        } else {
-            Serial.printf("[CAL] WARN: Node %d no data — using node 0 phase\n", node);
-            meanPhase[node] = meanPhase[0];
         }
     }
 
-    Serial.println("[CAL] Correction vector (node 0 = reference):");
-    for (int node = 0; node < NUM_ESP_NODES; node++) {
-        phaseCorrection[node] = meanPhase[0] - meanPhase[node];
-        Serial.printf("[CAL]   Node %d  mean=% .4f rad  correction=% .4f rad\n",
-                      node, meanPhase[node], phaseCorrection[node]);
+    // Pass 2: determine actual reference — prefer CAL_REFERENCE_NODE, fall back
+    // to the first node that received data if the preferred one has none
+    int refNode = -1;
+    if (count[CAL_REFERENCE_NODE] > 0) {
+        refNode = CAL_REFERENCE_NODE;
+    } else {
+        for (int node = 0; node < NUM_ESP_NODES; node++) {
+            if (count[node] > 0) { refNode = node; break; }
+        }
     }
+    if (refNode < 0) {
+        Serial.println("[CAL] ERROR: No nodes received data — calibration aborted");
+        return;
+    }
+    if (refNode != CAL_REFERENCE_NODE) {
+        Serial.printf("[CAL] WARN: Preferred reference node %d has no data — using node %d instead\n",
+                      CAL_REFERENCE_NODE, refNode);
+    }
+
+    // Build calValid bitmask and fill in missing nodes
+    calValid = 0x00;
+    for (int node = 0; node < NUM_ESP_NODES; node++) {
+        if (count[node] >= CAL_MIN_SAMPLES) {
+            calValid |= (1 << node);
+        } else {
+            Serial.printf("[CAL] WARN: Node %d uncalibrated (%d samples) — excluded from array\n",
+                          node, count[node]);
+            meanPhase[node] = meanPhase[refNode];  // correction = 0, will be masked in Python
+        }
+    }
+
+    Serial.printf("[CAL] Correction vector (node %d = reference):\n", refNode);
+    for (int node = 0; node < NUM_ESP_NODES; node++) {
+        phaseCorrection[node] = meanPhase[refNode] - meanPhase[node];
+        Serial.printf("[CAL]   Node %d  mean=% .4f rad  correction=% .4f rad  %s\n",
+                      node, meanPhase[node], phaseCorrection[node],
+                      (calValid >> node) & 1 ? "CAL" : "UNCAL");
+    }
+    Serial.printf("[CAL] Valid node mask: 0x%02X\n", calValid);
 
     calDone = true;
     Serial.println("[CAL] ── Calibration complete ───────────────\n");
+    verifyCalibration();
+}
+
+// ──────────────────────────────────────────────────────────
+//  verifyCalibration — non-blocking round-robin verification
+//
+//  Re-enables the cal path briefly, polls all 8 UARTs simultaneously
+//  for 2 seconds (same round-robin pattern as feedParsers so no UART
+//  starves or overflows), applies phaseCorrection[], then checks that
+//  all nodes' corrected phases converge to within 0.2 rad of node 0.
+//
+//  Call after runCalibration() has set phaseCorrection[].
+//  Also available as the "verify" serial command.
+// ──────────────────────────────────────────────────────────
+void verifyCalibration()
+{
+    if (!calDone) {
+        Serial.println("[VER] No calibration data — run 'cal' first");
+        return;
+    }
+
+    Serial.println("[VER] ── Verification start (2 s) ───────────");
+    setRFSwitch(true);
+    delay(100);   // let cal ESP32 ramp up
+
+    // Flush stale bytes
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        while (espSerials[i]->available()) espSerials[i]->read();
+
+    // Per-node accumulators
+    double sinV[NUM_ESP_NODES] = {};
+    double cosV[NUM_ESP_NODES] = {};
+    int    cntV[NUM_ESP_NODES] = {};
+
+    // Local parsers — independent of the main feedParsers() state
+    struct { uint8_t buf[PACKET_SIZE]; int count; } vp[NUM_ESP_NODES];
+    memset(vp, 0, sizeof(vp));
+
+    uint32_t deadline = millis() + 2000;
+    while (millis() < deadline)
+    {
+        for (int i = 0; i < NUM_ESP_NODES; i++)
+        {
+            while (espSerials[i]->available())
+            {
+                uint8_t b = (uint8_t)espSerials[i]->read();
+                if (vp[i].count == 0) {
+                    if (b == SYNC_BYTE) { vp[i].buf[0] = b; vp[i].count = 1; }
+                } else {
+                    vp[i].buf[vp[i].count++] = b;
+                    if (vp[i].count == PACKET_SIZE) {
+                        vp[i].count = 0;
+                        uint8_t chk = 0;
+                        for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= vp[i].buf[j];
+                        if (chk == vp[i].buf[PACKET_SIZE - 1]) {
+                            float raw;
+                            memcpy(&raw, &vp[i].buf[6], sizeof(float));
+                            float corrected = raw + phaseCorrection[i];
+                            sinV[i] += sin((double)corrected);
+                            cosV[i] += cos((double)corrected);
+                            cntV[i]++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    setRFSwitch(false);
+    Serial.println("[VER] RF switches → ANTENNA path");
+
+    // Compute corrected means; find first node with data to use as residual reference
+    float verMean[NUM_ESP_NODES] = {};
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        if (cntV[i] > 0)
+            verMean[i] = (float)atan2(sinV[i] / cntV[i], cosV[i] / cntV[i]);
+
+    int verRef = -1;
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        if (cntV[i] > 0) { verRef = i; break; }
+
+    if (verRef < 0) {
+        Serial.println("[VER] No nodes received data during verification");
+        setRFSwitch(false);
+        return;
+    }
+
+    Serial.println("[VER] Results (all corrected phases should agree):");
+    for (int node = 0; node < NUM_ESP_NODES; node++) {
+        if (cntV[node] == 0) {
+            Serial.printf("[VER]   Node %d  NO DATA\n", node);
+            continue;
+        }
+        float residual = fabsf(verMean[node] - verMean[verRef]);
+        if (residual > (float)M_PI) residual = 2.0f * (float)M_PI - residual;
+        Serial.printf("[VER]   Node %d  corrected=% .4f rad  residual=%.4f rad  %s  (n=%d)\n",
+                      node, verMean[node], residual,
+                      residual < 0.2f ? "PASS" : "WARN — check coax/switch",
+                      cntV[node]);
+    }
+    Serial.println("[VER] ── Verification complete ───────────────\n");
 }
 
 // ──────────────────────────────────────────────────────────

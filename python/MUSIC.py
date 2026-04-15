@@ -170,6 +170,9 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
     spectrum_db : (n_scan, n_scan) float  — MUSIC pseudo-spectrum in dB,
                   normalized to 0 dB peak. NaN outside the unit circle.
     peak_idx : int  — flat index into valid_mask for the peak point.
+    snr_db : float  — array SNR estimate in dB: ratio of largest to smallest
+                      eigenvalue of R.  Higher = stronger / more coherent signal.
+                      Not calibrated to absolute dBm; useful for relative comparison.
     """
     N = snapshot_matrix.shape[1]
 
@@ -178,8 +181,14 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
 
     # Eigendecomposition — eigh guarantees real eigenvalues for Hermitian R
     # and returns them in ascending order, so noise subspace = first Nr-K cols
-    _, V = np.linalg.eigh(R.astype(np.complex128))
+    eigvals, V = np.linalg.eigh(R.astype(np.complex128))
     V_noise = V[:, :Nr - num_sources].astype(np.complex64)  # (Nr, Nr-K)
+
+    # Array SNR: ratio of dominant eigenvalue to noise floor eigenvalue (dB).
+    # For a single source: lambda_max ≈ signal_power + noise, lambda_min ≈ noise.
+    snr_db = float(10.0 * np.log10(
+        np.maximum(eigvals[-1], 1e-12) / np.maximum(eigvals[0], 1e-12)
+    ))
 
     # Vectorized MUSIC metric for all valid (u, v) at once:
     #   P_MUSIC(a) = 1 / ||V_noise^H · a||²
@@ -200,7 +209,7 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
         spectrum_db = spectrum
 
     peak_idx = int(np.argmax(music_vals))
-    return spectrum_db, peak_idx
+    return spectrum_db, peak_idx, snr_db
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -229,14 +238,16 @@ class MusicProcessor:
         self._lock = threading.Lock()
 
         # Latest results (written by worker, read by display)
-        self.spectrum_db = np.full((n_scan, n_scan), np.nan, dtype=np.float32)
-        self.theta_deg   = float('nan')
-        self.phi_deg     = float('nan')
-        self.peak_u      = float('nan')
-        self.peak_v      = float('nan')
-        self.updates     = 0       # number of MUSIC updates completed
-        self.snapshots   = 0       # total snapshots received
-        self._res_lock   = threading.Lock()
+        self.spectrum_db    = np.full((n_scan, n_scan), np.nan, dtype=np.float32)
+        self.theta_deg      = float('nan')
+        self.phi_deg        = float('nan')
+        self.peak_u         = float('nan')
+        self.peak_v         = float('nan')
+        self.snr_db         = float('nan')
+        self.az_el_history  = deque(maxlen=60)   # (phi_deg, theta_deg) trail
+        self.updates        = 0       # number of MUSIC updates completed
+        self.snapshots      = 0       # total snapshots received
+        self._res_lock      = threading.Lock()
 
         self._stop_event = threading.Event()
         self._thread     = threading.Thread(target=self._worker, daemon=True)
@@ -262,13 +273,15 @@ class MusicProcessor:
         """Return a copy of the latest result dict (thread-safe)."""
         with self._res_lock:
             return {
-                'spectrum_db': self.spectrum_db.copy(),
-                'theta_deg':   self.theta_deg,
-                'phi_deg':     self.phi_deg,
-                'peak_u':      self.peak_u,
-                'peak_v':      self.peak_v,
-                'updates':     self.updates,
-                'snapshots':   self.snapshots,
+                'spectrum_db':   self.spectrum_db.copy(),
+                'theta_deg':     self.theta_deg,
+                'phi_deg':       self.phi_deg,
+                'peak_u':        self.peak_u,
+                'peak_v':        self.peak_v,
+                'snr_db':        self.snr_db,
+                'az_el_history': list(self.az_el_history),
+                'updates':       self.updates,
+                'snapshots':     self.snapshots,
             }
 
     def _worker(self):
@@ -293,7 +306,7 @@ class MusicProcessor:
             X = np.array(window).T   # (Nr, N_snapshots)
 
             try:
-                spectrum_db, peak_idx = run_music(
+                spectrum_db, peak_idx, snr_db = run_music(
                     X, self._A_steer, self._valid_mask,
                     self._n_scan, self._num_sources)
             except np.linalg.LinAlgError:
@@ -302,7 +315,8 @@ class MusicProcessor:
             pu = float(self._valid_u[peak_idx])
             pv = float(self._valid_v[peak_idx])
             uv2 = pu ** 2 + pv ** 2
-            theta = float(np.degrees(np.arcsin(np.sqrt(min(uv2, 1.0)))))
+            # θ = angle from array normal: 90° = broadside (centre), 0° = edge-on
+            theta = float(np.degrees(np.arccos(np.sqrt(min(uv2, 1.0)))))
             phi   = float(np.degrees(np.arctan2(pv, pu)))
 
             with self._res_lock:
@@ -311,6 +325,8 @@ class MusicProcessor:
                 self.peak_v      = pv
                 self.theta_deg   = theta
                 self.phi_deg     = phi
+                self.snr_db      = snr_db
+                self.az_el_history.append((phi, theta))
                 self.updates    += 1
 
 
@@ -326,8 +342,9 @@ def simulate_snapshots(processor, theta_deg, phi_deg, snr_db, stop_event):
     """
     theta = np.radians(theta_deg)
     phi   = np.radians(phi_deg)
-    u = np.sin(theta) * np.cos(phi)
-    v = np.sin(theta) * np.sin(phi)
+    # θ = angle from array normal (90° = broadside), so direction cosines use cos(θ)
+    u = np.cos(theta) * np.cos(phi)
+    v = np.cos(theta) * np.sin(phi)
 
     # True steering vector
     ax = np.exp(2j * np.pi * d * np.arange(Nx) * u)
@@ -402,8 +419,8 @@ def _setup_backend(args):
 def build_figure(n_scan, vmin_db):
     """Create the matplotlib figure and return handles needed for animation."""
     import matplotlib.pyplot as plt  # backend must already be set by _setup_backend()
-    fig, axes = plt.subplots(1, 2, figsize=(13, 6),
-                             gridspec_kw={'width_ratios': [3, 1]})
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6),
+                             gridspec_kw={'width_ratios': [3, 2, 1]})
     fig.patch.set_facecolor('#1a1a2e')
 
     # ── Left: 2D MUSIC heatmap ────────────────────────────────────────────────
@@ -451,8 +468,40 @@ def build_figure(n_scan, vmin_db):
     title = ax_map.set_title('2D MUSIC — waiting for data...', color='white',
                               fontsize=11, pad=8)
 
+    # ── Middle: az-el direction panel ────────────────────────────────────────
+    ax_azel = axes[1]
+    ax_azel.set_facecolor('#16213e')
+    ax_azel.set_xlim(-180, 180)
+    ax_azel.set_ylim(0, 90)
+    ax_azel.set_xlabel('Azimuth φ (°)', color='white', fontsize=10)
+    ax_azel.set_ylabel('Elevation θ from normal (°)', color='white', fontsize=10)
+    ax_azel.set_title('Direction Estimate', color='white', fontsize=10, pad=6)
+    ax_azel.tick_params(colors='white')
+    ax_azel.set_xticks([-180, -90, 0, 90, 180])
+    ax_azel.set_yticks([0, 30, 60, 90])
+    for spine in ax_azel.spines.values():
+        spine.set_edgecolor('#555577')
+
+    # Grid lines
+    for xv in [-90, 0, 90]:
+        ax_azel.axvline(xv, color='#444466', linewidth=0.6, linestyle=':')
+    for yv in [30, 60, 90]:
+        ax_azel.axhline(yv, color='#444466', linewidth=0.6, linestyle=':')
+
+    # Label key angles
+    ax_azel.text(0, 91, 'boresight', color='#888899', fontsize=7,
+                 ha='center', va='bottom')
+    ax_azel.text(-179, 1, 'left', color='#888899', fontsize=7, ha='left')
+    ax_azel.text(179, 1, 'right', color='#888899', fontsize=7, ha='right')
+
+    # Trail scatter (fading history) — empty initially
+    az_trail = ax_azel.scatter([], [], s=18, zorder=4)
+
+    # Current estimate marker
+    az_dot, = ax_azel.plot([], [], 'r+', markersize=16, markeredgewidth=2.5, zorder=5)
+
     # ── Right: info panel ─────────────────────────────────────────────────────
-    ax_info = axes[1]
+    ax_info = axes[2]
     ax_info.set_facecolor('#16213e')
     ax_info.set_xlim(0, 1)
     ax_info.set_ylim(0, 1)
@@ -483,10 +532,10 @@ def build_figure(n_scan, vmin_db):
 
     plt.tight_layout(pad=1.5)
 
-    return fig, im, peak_dot, title, info_text
+    return fig, im, peak_dot, title, info_text, az_trail, az_dot
 
 
-def _apply_result(result, im, peak_dot, title_obj, info_text, args):
+def _apply_result(result, im, peak_dot, title_obj, info_text, az_trail, az_dot, args):
     """Update all plot artists from a result dict. Returns True if data was ready."""
     spectrum = result['spectrum_db']
     updates  = result['updates']
@@ -501,17 +550,45 @@ def _apply_result(result, im, peak_dot, title_obj, info_text, args):
         th = result['theta_deg']
         ph = result['phi_deg']
 
+        snr = result['snr_db']
+        # Visual bar: 0 dB = no signal, ~30 dB = strong. Clamp to [0, 30].
+        bar_filled = int(min(max(snr, 0.0), 30.0) / 30.0 * 10)
+        snr_bar = '█' * bar_filled + '░' * (10 - bar_filled)
+
+        # ── Az-el trail ───────────────────────────────────────────────────────
+        history = result['az_el_history']
+        if history:
+            hist_phi   = [p for p, t in history]
+            hist_theta = [t for p, t in history]
+            n = len(history)
+            alphas = np.linspace(0.08, 0.75, n)
+            rgba = np.zeros((n, 4))
+            rgba[:, 0] = 0.35   # R
+            rgba[:, 1] = 0.75   # G
+            rgba[:, 2] = 1.0    # B
+            rgba[:, 3] = alphas
+            az_trail.set_offsets(np.column_stack([hist_phi, hist_theta]))
+            az_trail.set_facecolor(rgba)
+            az_trail.set_edgecolor('none')
+        az_dot.set_data([ph], [th])
+
         peak_dot.set_data([pu], [pv])
         title_obj.set_text(
-            f'2D MUSIC — 2×4 array   θ = {th:.1f}°   φ = {ph:.1f}°'
+            f'2D MUSIC — 2×4 array   θ = {th:.1f}°   φ = {ph:.1f}°   SNR {snr:.1f} dB'
         )
         info_text.set_text(
             f"ESTIMATE\n"
             f"────────────────\n"
-            f"θ (elevation) : {th:+6.1f}°\n"
+            f"θ from normal : {th:+6.1f}°\n"
+            f"  (90°=boresight, 0°=edge)\n"
             f"φ (azimuth)   : {ph:+6.1f}°\n"
             f"u             : {pu:+.3f}\n"
             f"v             : {pv:+.3f}\n"
+            f"\n"
+            f"SIGNAL\n"
+            f"────────────────\n"
+            f"Array SNR     : {snr:+.1f} dB\n"
+            f"{snr_bar}  (0–30 dB)\n"
             f"\n"
             f"STATS\n"
             f"────────────────\n"
@@ -540,7 +617,8 @@ def launch_display(processor, args, stop_event):
     _setup_backend(args)
     import matplotlib.pyplot as plt   # safe to import now
 
-    fig, im, peak_dot, title_obj, info_text = build_figure(args.scan, args.vmin)
+    fig, im, peak_dot, title_obj, info_text, az_trail, az_dot = \
+        build_figure(args.scan, args.vmin)
 
     if args.save:
         # ── Headless save mode: manual loop, no GUI needed ────────────────────
@@ -549,7 +627,8 @@ def launch_display(processor, args, stop_event):
         try:
             while not stop_event.is_set():
                 result = processor.get_result()
-                _apply_result(result, im, peak_dot, title_obj, info_text, args)
+                _apply_result(result, im, peak_dot, title_obj, info_text,
+                              az_trail, az_dot, args)
                 fname = f"music_frame_{frame:04d}.png"
                 fig.savefig(fname, dpi=100, facecolor=fig.get_facecolor())
                 print(f"\r[display] Saved {fname}  "
@@ -571,7 +650,8 @@ def launch_display(processor, args, stop_event):
         try:
             while not stop_event.is_set():
                 result = processor.get_result()
-                _apply_result(result, im, peak_dot, title_obj, info_text, args)
+                _apply_result(result, im, peak_dot, title_obj, info_text,
+                              az_trail, az_dot, args)
                 fig.canvas.draw_idle()   # queue redraw
                 plt.pause(0.2)           # pump GUI event loop + execute redraw
                 if not plt.fignum_exists(fig.number):
@@ -649,7 +729,15 @@ def serial_bridge(ns, processor, stop_event):
                 print(f"[bridge] Still waiting for packets... ({count} received so far)")
                 last_report = time.time()
             continue
-        processor.push_snapshot(snap['phases'])
+
+        phases   = snap['phases']
+        cal_mask = snap.get('cal_mask', 0xFF)   # default all-valid if key absent
+
+        # Zero out phases for uncalibrated nodes so they don't corrupt the array
+        # response.  exp(1j*0) = 1+0j which contributes a flat phase — less bad
+        # than a random hardware offset, and the SNR will reflect the reduced array.
+        masked = [p if (cal_mask >> i) & 1 else 0.0 for i, p in enumerate(phases)]
+        processor.push_snapshot(masked)
         count += 1
         if count <= 5 or count % 50 == 0:
             print(f"[bridge] pkt #{count}  seq={snap['seq']}  phases={[f'{p:.2f}' for p in snap['phases']]}")

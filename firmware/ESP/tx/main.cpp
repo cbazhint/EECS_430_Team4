@@ -1,114 +1,84 @@
 /*
- * ESP32-S3 Calibration Reference Transmitter
- * Phase-Coherent Direction of Arrival (DoA) System
+ * ESP32-S3 — ESP-NOW Beacon Transmitter
  *
- * Replaces the nRF24L01+ as the CW reference source.
- * Transmits standard 802.11 frames on channel 6 so that the 8 sensor
- * ESP32s (running in promiscuous/CSI mode) can extract phase measurements.
+ * Sends broadcast ESP-NOW frames on a fixed channel.
+ * ESP-NOW uses properly formatted 802.11 Action frames which trigger
+ * real CSI capture on the receiving nodes (unlike raw esp_wifi_80211_tx
+ * which doesn't reliably produce non-zero I/Q values).
+ *
+ * Receiver only needs promiscuous mode + CSI enabled — no ESP-NOW
+ * stack required on the receiver side.
  *
  * Control:
- *   CAL_TRIGGER_PIN (GPIO 4) is wired to Nucleo PF_1 — the same line that
- *   drives all 8 BGS12WN6 RF switch CTRL pins.
- *
- *   PF_1 LOW  → switches on antenna path,  this node at IDLE rate (~10 Hz)
- *   PF_1 HIGH → switches on cal path,      this node at CAL  rate (~100 Hz)
- *
- * No UART, no SPI — purely a WiFi transmitter.
+ *   The Nucleo controls when the cal signal reaches sensor nodes by toggling
+ *   the BGS12WN6 RF switches (PF_1).  This transmitter runs at fixed 100 Hz
+ *   continuously — the switches handle the gating, not this firmware.
  */
 
 #include <WiFi.h>
+#include <esp_now.h>
 #include "esp_wifi.h"
-#include <Arduino.h>
 
-/* ============================================================
-   CONFIGURATION
-   ============================================================ */
-#define CAL_TRIGGER_PIN  4       // GPIO wired to Nucleo PF_1 / BGS12WN6 CTRL net
-#define WIFI_CHANNEL     6       // must match sensor node WIFI_CHANNEL
-#define AP_SSID          "DoA-REF"
+#define WIFI_CHAN       6
+#define TX_INTERVAL_MS  10   // 100 Hz — fast enough for good CSI snapshots
 
-#define CAL_TX_RATE_MS   10      // 100 Hz during calibration window
-#define IDLE_TX_RATE_MS  100     // 10 Hz at idle (beacons already at ~10 Hz)
+static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-/* ============================================================
-   Raw 802.11 null-data frame template
-   Injected via esp_wifi_80211_tx() — hardware appends FCS.
-   DA = broadcast so every sensor in promiscuous mode captures it.
-   SA / BSSID = fixed MAC for the DoA reference node.
-   ============================================================ */
-static uint8_t raw_frame[] = {
-    0x48, 0x00,                            // Frame Control: data, subtype=null
-    0x00, 0x00,                            // Duration
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,    // DA: broadcast
-    0x24, 0x6F, 0x28, 0xCA, 0x11, 0x00,   // SA:    DoA-REF fixed MAC
-    0x24, 0x6F, 0x28, 0xCA, 0x11, 0x00,   // BSSID: DoA-REF fixed MAC
-    0x00, 0x00,                            // Sequence Control
-};
-
-/* ============================================================
-   Globals
-   ============================================================ */
-static volatile bool cal_active = false;
-
-/* ============================================================
-   Calibration trigger ISR
-   ============================================================ */
-void IRAM_ATTR cal_isr()
-{
-    cal_active = (digitalRead(CAL_TRIGGER_PIN) == HIGH);
-}
-
-/* ============================================================
-   Setup
-   ============================================================ */
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
-    Serial.println("[CAL-TX] Booting...");
+    delay(500);   // brief settle — do NOT block on !Serial (no monitor = hang)
 
-    // SoftAP provides automatic beacon frames at ~10 Hz
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, NULL, WIFI_CHANNEL, 0 /*hidden=false*/, 1 /*max clients*/);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
+
     esp_wifi_set_max_tx_power(78);  // 78 = ~19.5 dBm (hardware maximum)
 
-    Serial.printf("[CAL-TX] SoftAP '%s' on ch%d  max TX power set\n",
-                  AP_SSID, WIFI_CHANNEL);
+    // Lock to the correct channel before ESP-NOW init
+    esp_wifi_set_channel(WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
 
-    // Cal trigger: shared with RF switch CTRL net
-    pinMode(CAL_TRIGGER_PIN, INPUT);
-    attachInterrupt(digitalPinToInterrupt(CAL_TRIGGER_PIN), cal_isr, CHANGE);
-    cal_active = (digitalRead(CAL_TRIGGER_PIN) == HIGH);
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println("[TX] ERROR: ESP-NOW init failed");
+        return;
+    }
 
-    Serial.printf("[CAL-TX] Cal trigger on GPIO%d — initial state: %s\n",
-                  CAL_TRIGGER_PIN, cal_active ? "CAL (HIGH)" : "IDLE (LOW)");
-    Serial.println("[CAL-TX] Ready.");
+    // Register broadcast peer
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, broadcast_addr, 6);
+    peer.channel = WIFI_CHAN;
+    peer.encrypt = false;
+
+    if (esp_now_add_peer(&peer) != ESP_OK)
+    {
+        Serial.println("[TX] ERROR: add peer failed");
+        return;
+    }
+
+    Serial.printf("[TX] ESP-NOW beacon on ch%d @ %dHz  max TX power set\n",
+                  WIFI_CHAN, 1000 / TX_INTERVAL_MS);
 }
 
-/* ============================================================
-   Main Loop — inject frames at rate determined by cal trigger
-   ============================================================ */
 void loop()
 {
-    static uint32_t last_tx   = 0;
-    static uint32_t last_diag = 0;
-    static uint32_t tx_count  = 0;
+    static uint32_t seq = 0;
 
-    uint32_t now      = millis();
-    uint32_t interval = cal_active ? CAL_TX_RATE_MS : IDLE_TX_RATE_MS;
+    // Payload just needs to exist — content doesn't matter for CSI
+    uint8_t data[4];
+    data[0] = 0xDE;               // magic
+    data[1] = 0xAD;
+    data[2] = (seq >> 8) & 0xFF;
+    data[3] =  seq       & 0xFF;
+    seq++;
 
-    if (now - last_tx >= interval)
-    {
-        last_tx = now;
-        esp_wifi_80211_tx(WIFI_IF_AP, raw_frame, sizeof(raw_frame), false);
-        tx_count++;
-    }
+    esp_err_t result = esp_now_send(broadcast_addr, data, sizeof(data));
 
-    // Status print every 5 s
-    if (now - last_diag >= 5000)
-    {
-        last_diag = now;
-        Serial.printf("[CAL-TX] mode=%s  frames_sent=%lu\n",
-                      cal_active ? "CAL" : "IDLE", tx_count);
-    }
+    // Only print errors and a heartbeat every 100 packets (~1 s at 100 Hz)
+    if (result != ESP_OK)
+        Serial.printf("[TX] send error: %s\n", esp_err_to_name(result));
+    else if (seq % 100 == 0)
+        Serial.printf("[TX] alive — seq=%lu\n", seq);
+
+    delay(TX_INTERVAL_MS);
 }

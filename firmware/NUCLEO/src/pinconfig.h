@@ -28,10 +28,11 @@
 #define PACKET_SIZE         11       // bytes per ESP→Nucleo CSI packet
 
 // Host packet protocol (Nucleo → PC over ST-Link VCP)
-// 41 bytes: [0xBB][0xCC][seq u16 LE][ts u32 LE][phase×8 f32 LE][XOR chk]
+// 42 bytes: [0xBB][0xCC][seq u16 LE][ts u32 LE][phase×8 f32 LE][cal_mask u8][XOR chk]
+//   cal_mask: bit i set = node i has valid calibration correction
 #define HOST_SYNC_A         0xBB
 #define HOST_SYNC_B         0xCC
-#define HOST_PKT_SIZE       41
+#define HOST_PKT_SIZE       42
 
 // Snapshot assembly window — send after this many ms even if not all nodes reported
 #define SNAP_TIMEOUT_MS     50

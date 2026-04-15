@@ -47,14 +47,14 @@ TIMEOUT  = 1                # serial read timeout (seconds)
 # ── Host packet constants ─────────────────────────────────────────────────────
 HOST_SYNC_A   = 0xBB
 HOST_SYNC_B   = 0xCC
-HOST_PKT_SIZE = 41          # 2 sync + 2 seq + 4 ts + 32 phases + 1 chk
+HOST_PKT_SIZE = 42          # 2 sync + 2 seq + 4 ts + 32 phases + 1 cal_mask + 1 chk
 _PHASES_FMT   = '<8f'       # 8 × float32 LE starting at byte 8
 _SEQ_FMT      = '<H'        # uint16 LE at byte 2
 _TS_FMT       = '<I'        # uint32 LE at byte 4
 
 
 def _validate_host_checksum(raw: bytes) -> bool:
-    """XOR of bytes [0..39] must equal byte [40]."""
+    """XOR of bytes [0..40] must equal byte [41]."""
     chk = 0
     for b in raw[:HOST_PKT_SIZE - 1]:
         chk ^= b
@@ -63,10 +63,11 @@ def _validate_host_checksum(raw: bytes) -> bool:
 
 def _parse_host_packet(raw: bytes) -> dict | None:
     """
-    Parse a validated 41-byte host packet.
+    Parse a validated 42-byte host packet.
 
     Returns:
-        {'seq': int, 'timestamp_ms': int, 'phases': list[float]}
+        {'seq': int, 'timestamp_ms': int, 'phases': list[float],
+         'cal_mask': int}   — cal_mask bit i = node i has valid calibration
         or None on bad length / bad checksum.
     """
     if len(raw) != HOST_PKT_SIZE:
@@ -79,11 +80,13 @@ def _parse_host_packet(raw: bytes) -> dict | None:
     seq      = struct.unpack_from(_SEQ_FMT,   raw, 2)[0]
     ts_ms    = struct.unpack_from(_TS_FMT,    raw, 4)[0]
     phases   = list(struct.unpack_from(_PHASES_FMT, raw, 8))
+    cal_mask = raw[40]
 
     return {
         'seq':          seq,
         'timestamp_ms': ts_ms,
         'phases':       phases,   # list of 8 floats, radians, already corrected
+        'cal_mask':     cal_mask, # bitmask: bit i set = node i is calibrated
     }
 
 
