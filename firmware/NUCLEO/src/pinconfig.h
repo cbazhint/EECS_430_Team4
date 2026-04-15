@@ -90,39 +90,41 @@
 //  UART8 status depends on your PE1 resolution.
 // ──────────────────────────────────────────────────────────
 
-// ESP32 Node 1 — USART1
+//Pins below are Nucleos perspective
+
+// ESP32 Node 1 — USART1 [3]
 #define ESP1_UART_TX        PB_6   
 #define ESP1_UART_RX        PB_7  
 
-// ESP32 Node 2 — USART2
-#define ESP2_UART_TX        PA_2    
-#define ESP2_UART_RX        PA_3   
+// ESP32 Node 2 — USART2 [2]
+#define ESP2_UART_TX        PA_3    
+#define ESP2_UART_RX        PA_2   
 
-// ESP32 Node 3 — USART6
+// ESP32 Node 3 — USART6 [1]
 #define ESP3_UART_TX        PA_1    // !! CONFLICT if also used for RF_SWITCH_CTRL !!
 #define ESP3_UART_RX        PA_0    // TODO: verify
 
-// ESP32 Node 4 — UART4
+// ESP32 Node 4 — UART4 [0]
 #define ESP4_UART_TX        PB_12  // TODO: verify
 #define ESP4_UART_RX        PB_13 // TODO: verify
 
-// ESP32 Node 5 — UART5
-#define ESP5_UART_TX        PC_6 //ODO: verify
-#define ESP5_UART_RX        PC_7
+// ESP32 Node 5 — UART5 [4]
+#define ESP5_UART_TX        PC_7 //ODO: verify
+#define ESP5_UART_RX        PC_6
 
-// ESP32 Node 6 — UART7
-#define ESP6_UART_TX        PF_7
-#define ESP6_UART_RX        PF_6               
+// ESP32 Node 6 — UART7 [5]
+#define ESP6_UART_TX        PF_6
+#define ESP6_UART_RX        PF_7               
 
-// ESP32 Node 7 — UART8
+// ESP32 Node 7 — UART8 [6]
 //  ** PE1 (only TX option) is hardwired to LD2 on Nucleo **
 //  If you resolved this, fill in. Otherwise use alt peripheral.
-#define ESP7_UART_TX        PE_1    // TODO: confirm PE1 conflict resolved
-#define ESP7_UART_RX        PE_0    // TODO: verify
+#define ESP7_UART_TX        PE_0    // TODO: confirm PE1 conflict resolved
+#define ESP7_UART_RX        PE_1    // TODO: verify
 
-// ESP32 Node 8 — LPUART1
-#define ESP8_UART_TX        PA_9
-#define ESP8_UART_RX        PA_10
+// ESP32 Node 8 — LPUART1 [7]
+#define ESP8_UART_TX        PA_10
+#define ESP8_UART_RX        PA_9
 
 // ─────────────────────────────────────────────────────────
 //  Sync pulse GPIO (optional)
