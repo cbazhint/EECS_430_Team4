@@ -22,11 +22,13 @@ static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial) delay(10);
+    delay(500);   // brief settle — do NOT block on !Serial (no monitor = hang)
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
+
+    esp_wifi_set_max_tx_power(78);  // 78 = ~19.5 dBm (hardware maximum)
 
     // Lock to the correct channel before ESP-NOW init
     esp_wifi_set_channel(WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
@@ -49,7 +51,7 @@ void setup()
         return;
     }
 
-    Serial.printf("[TX] ESP-NOW beacon transmitter ready on ch%d @ %dHz\n",
+    Serial.printf("[TX] ESP-NOW beacon on ch%d @ %dHz  max TX power set\n",
                   WIFI_CHAN, 1000 / TX_INTERVAL_MS);
 }
 
@@ -67,10 +69,11 @@ void loop()
 
     esp_err_t result = esp_now_send(broadcast_addr, data, sizeof(data));
 
-    if (result == ESP_OK)
-        Serial.printf("[TX] seq=%lu sent\n", seq);
-    else
+    // Only print errors and a heartbeat every 500 packets (~5 s at 100 Hz)
+    if (result != ESP_OK)
         Serial.printf("[TX] send error: %s\n", esp_err_to_name(result));
+    else if (seq % 100 == 0)
+        Serial.printf("[TX] alive — seq=%lu\n", seq);
 
     delay(TX_INTERVAL_MS);
 }
