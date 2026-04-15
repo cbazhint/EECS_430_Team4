@@ -275,10 +275,11 @@ class MusicProcessor:
         last_processed = 0
         while not self._stop_event.is_set():
             with self._lock:
-                n = len(self._buf)
+                n     = len(self._buf)
+                total = self.snapshots   # absolute count — never decreases
 
-            # Wait until we have enough snapshots AND enough new ones
-            if n < self._n_snapshots or (n - last_processed) < self._update_every:
+            # Wait until buffer has enough AND enough new snapshots since last update
+            if n < self._n_snapshots or (total - last_processed) < self._update_every:
                 time.sleep(0.01)
                 continue
 
@@ -286,7 +287,7 @@ class MusicProcessor:
             with self._lock:
                 window = list(self._buf)[-self._n_snapshots:]
 
-            last_processed = n
+            last_processed = total   # advance by absolute count, not buffer length
 
             # Build snapshot matrix (Nr, N_snapshots)
             X = np.array(window).T   # (Nr, N_snapshots)
