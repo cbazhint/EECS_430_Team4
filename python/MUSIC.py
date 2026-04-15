@@ -586,6 +586,53 @@ def launch_display(processor, args, stop_event):
 #  Serial reader bridge
 # ══════════════════════════════════════════════════════════════════════════════
 
+def run_calibration(port, baudrate, timeout_s=60):
+    """
+    Send 'cal' to the Nucleo over a raw serial connection and block until
+    the Nucleo prints the calibration-complete marker or timeout_s elapses.
+
+    Opens and closes the port itself so NucleoSerial can open it cleanly
+    afterwards.  Returns True on success, False on timeout or error.
+    """
+    import serial as _serial
+    print(f"[cal] Opening {port} for calibration sequence...")
+    try:
+        ser = _serial.Serial(port, baudrate, timeout=1)
+        ser.dtr = False   # prevent DTR reset on open
+        ser.rts = False
+    except Exception as e:
+        print(f"[cal] Could not open port: {e}")
+        return False
+
+    time.sleep(0.5)
+    ser.reset_input_buffer()
+    ser.write(b'cal\n')
+    print("[cal] Sent 'cal' — waiting for Nucleo (up to "
+          f"{timeout_s}s)...\n")
+
+    deadline = time.time() + timeout_s
+    success  = False
+    try:
+        while time.time() < deadline:
+            line = ser.readline().decode('utf-8', errors='replace').strip()
+            if line:
+                print(f"  [Nucleo] {line}")
+            if 'Calibration complete' in line:
+                success = True
+                break
+    except Exception as e:
+        print(f"[cal] Serial error during calibration: {e}")
+    finally:
+        ser.close()
+
+    if success:
+        print("\n[cal] Calibration complete — continuing to streaming.\n")
+    else:
+        print(f"\n[cal] WARNING: calibration timed out after {timeout_s}s. "
+              "Corrections may be zero.\n")
+    return success
+
+
 def serial_bridge(ns, processor, stop_event):
     """
     Pull snapshots from NucleoSerial and push into the MUSIC processor.
@@ -644,6 +691,8 @@ def parse_args():
                    help='Save frames as PNGs instead of live display')
     p.add_argument('--backend',   default=None,
                    help='Matplotlib backend override, e.g. TkAgg, Qt5Agg, wxAgg')
+    p.add_argument('--cal',       action='store_true',
+                   help='Run calibration on startup before streaming')
     return p.parse_args()
 
 
@@ -693,13 +742,18 @@ def main():
         sim_thread.start()
         ns = None
     else:
+        if args.cal:
+            run_calibration(args.port, args.baud)
+
         print(f"[init] Connecting to Nucleo on {args.port} @ {args.baud} baud...")
         try:
             from serialRead import NucleoSerial
             ns = NucleoSerial(port=args.port, baudrate=args.baud)
             ns.start()
-            print("[init] Waiting 2 s for Nucleo boot...")
-            time.sleep(2)
+            if not args.cal:
+                # Only wait for boot if we didn't just spend time calibrating
+                print("[init] Waiting 2 s for Nucleo boot...")
+                time.sleep(2)
             ns.send_command('run')
             print("[init] Sent 'run' command to Nucleo — streaming started")
         except Exception as e:

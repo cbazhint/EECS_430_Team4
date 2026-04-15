@@ -19,7 +19,7 @@
 /* ============================================================
    CONFIGURATION - adjust per node before flashing
    ============================================================ */
-#define NODE_ID             7
+#define NODE_ID             0
 #define UART_TX_PIN         17
 #define UART_RX_PIN         18
 #define UART_BAUD           921600
@@ -33,6 +33,8 @@
    ============================================================ */
 static volatile bool     csi_data_ready = false;
 static volatile float    csi_phase      = 0.0f;
+static volatile float    csi_amplitude  = 0.0f;
+static volatile int8_t   csi_rssi       = 0;
 static volatile uint32_t csi_timestamp  = 0;
 
 // Diagnostic counters — incremented in callbacks, printed from loop()
@@ -85,6 +87,8 @@ void IRAM_ATTR csi_rx_callback(void *ctx, wifi_csi_info_t *info)
     }
 
     csi_phase      = atan2f((float)imag, (float)real_part);
+    csi_amplitude  = sqrtf((float)imag * imag + (float)real_part * real_part);
+    csi_rssi       = info->rx_ctrl.rssi;
     csi_timestamp  = ts;
     csi_data_ready = true;
     dbg_cb_ok++;
@@ -193,12 +197,15 @@ void loop()
     if (csi_data_ready)
     {
         float    phase = csi_phase;
+        float    amp   = csi_amplitude;
+        int8_t   rssi  = csi_rssi;
         uint32_t ts    = csi_timestamp;
         csi_data_ready = false;
 
         send_csi_packet(phase, ts);
 
-        Serial.printf("[Node %d] PHASE t=%lu phase=%.4f rad\n", NODE_ID, ts, phase);
+        Serial.printf("[Node %d] phase=%.4f rad  amp=%.1f  rssi=%d dBm\n",
+                      NODE_ID, phase, amp, rssi);
     }
 
     // Diagnostic dump every 2 seconds
