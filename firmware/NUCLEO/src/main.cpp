@@ -390,49 +390,15 @@ void initRFSwitchGPIO() {
 }
 
 void initNRF24() {
-    Serial.println("I AM INITIALIZING!!!");
-    // Remap SPI1 to PB3/PB4/PB5 — avoids PA7 Ethernet conflict and PC10/PC11 SDMMC pull-downs
-    SPI.setMOSI(NRF24_MOSI_PIN);  // PB_5 → SPI1 MOSI
-    SPI.setMISO(NRF24_MISO_PIN);  // PB_4 → SPI1 MISO
-    SPI.setSCLK(NRF24_SCK_PIN);   // PB_3 → SPI1 SCK
-
-    // ── Raw SPI diagnostic — read nRF24 STATUS register directly ─────────────
-    // STATUS reg (addr 0x07) resets to 0x0E on a working chip.
-    // 0xFF = MISO floating (not connected)
-    // 0x00 = MISO pulled low (short or wrong pin)
-    // 0x0E = SPI working, chip alive
-    SPI.begin();
-    Serial.println("[nRF24] SPI.begin() returned (SPI3 pins)");
-    Serial.flush();
-    pinMode(NRF24_CS_PIN, OUTPUT);
-    digitalWrite(NRF24_CS_PIN, HIGH);
-    delay(5);
-    digitalWrite(NRF24_CS_PIN, LOW);
-    uint8_t spiStatus = SPI.transfer(0xFF);  // NOP command returns STATUS byte
-    digitalWrite(NRF24_CS_PIN, HIGH);
-    Serial.printf("[nRF24] Raw STATUS via SPI3: 0x%02X  (expect 0x0E)\n", spiStatus);
-    Serial.flush();
-    // ─────────────────────────────────────────────────────────────────────────
-
-    if (!radio.begin()) {
-        Serial.println("[WARN] nRF24: radio.begin() failed — check wiring");
-        bootStatus.nrf24 = false;
-        return;
-    }
-    // nRF channel N = (2400+N) MHz  →  WiFi ch 6 (2437 MHz) = nRF ch 37
-    radio.setPALevel(RF24_PA_MAX);
-    radio.setDataRate(RF24_250KBPS);
-    radio.setChannel(NRF24_WIFI_CHANNEL);
-    radio.stopListening();
-    bootStatus.nrf24 = true;
-    Serial.printf("  nRF24 ready: ch=%d (%.0f MHz), 250kbps, PA=MAX\n",
-                  NRF24_WIFI_CHANNEL, 2400.0f + NRF24_WIFI_CHANNEL);
+    // nRF24L01+ replaced by cal ESP32 (DoA-REF) — no SPI init needed.
+    // Cal ESP32 transmits 802.11 frames on ch6; triggered via RF_SWITCH_CTRL_PIN.
+    bootStatus.nrf24 = true;   // always ready — cal ESP32 is always-on
+    Serial.println("  Cal ESP32 (DoA-REF) replaces nRF24 — no SPI required");
 }
 
 bool testNRF24Link() {
-    bool ok = radio.isChipConnected();
-    if (!ok) Serial.println("[WARN] nRF24: isChipConnected() = false");
-    return ok;
+    // Cal ESP32 is always-on; no link test needed.
+    return true;
 }
 
 void initESP32UARTs() {
@@ -492,19 +458,15 @@ void runCalibration()
 {
     Serial.println("[CAL] ── Calibration start ──────────────────");
 
-    if (!bootStatus.nrf24) {
-        Serial.println("[CAL] ERROR: nRF24 not ready — skipping calibration");
-        return;
-    }
-
-    Serial.println("[CAL] RF switches → REFERENCE path (nRF trace)");
+    // Assert PF_1 HIGH: simultaneously flips all RF switches to reference path
+    // AND signals the cal ESP32 (DoA-REF) to ramp to 100 Hz frame injection
+    Serial.println("[CAL] RF switches → REFERENCE path (cal ESP32 transmitting)");
     setRFSwitch(true);
-    delay(50);
+    delay(100);   // let TX ESP32 ramp up and sensors lock on
 
-    radio.openWritingPipe((const uint8_t*)NRF24_CAL_ADDRESS);
-    radio.stopListening();
-
-    uint8_t calPayload[4] = {0xCA, 0x1B, 0x00, 0x00};
+    // Flush stale bytes from all UARTs before collecting samples
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        while (espSerials[i]->available()) espSerials[i]->read();
 
     double sinSum[NUM_ESP_NODES] = {};
     double cosSum[NUM_ESP_NODES] = {};
@@ -518,10 +480,7 @@ void runCalibration()
 
         for (int s = 0; s < CAL_SAMPLES; s++)
         {
-            calPayload[2] = (uint8_t)node;
-            calPayload[3] = (uint8_t)s;
-            radio.write(calPayload, sizeof(calPayload));
-
+            // Cal ESP32 transmits at 100 Hz — just wait for sensor to report
             uint8_t rxId;
             float   rxPhase;
             if (readCSIPacket(espSerials[node], &rxId, &rxPhase, CAL_TIMEOUT_MS)) {
@@ -536,9 +495,9 @@ void runCalibration()
         Serial.printf("  (%d/%d)\n", count[node], CAL_SAMPLES);
     }
 
-    radio.powerDown();
+    // De-assert PF_1: RF switches back to antenna path, cal ESP32 drops to idle
     setRFSwitch(false);
-    Serial.println("[CAL] nRF powered down, RF switches → ANTENNA path");
+    Serial.println("[CAL] RF switches → ANTENNA path, cal ESP32 → idle rate");
 
     float meanPhase[NUM_ESP_NODES] = {};
     for (int node = 0; node < NUM_ESP_NODES; node++) {
