@@ -184,12 +184,6 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
     eigvals, V = np.linalg.eigh(R.astype(np.complex128))
     V_noise = V[:, :Nr - num_sources].astype(np.complex64)  # (Nr, Nr-K)
 
-    # Array SNR: ratio of dominant eigenvalue to noise floor eigenvalue (dB).
-    # For a single source: lambda_max ≈ signal_power + noise, lambda_min ≈ noise.
-    snr_db = float(10.0 * np.log10(
-        np.maximum(eigvals[-1], 1e-12) / np.maximum(eigvals[0], 1e-12)
-    ))
-
     # Vectorized MUSIC metric for all valid (u, v) at once:
     #   P_MUSIC(a) = 1 / ||V_noise^H · a||²
     # proj[n] = V_noise^H · a_n  →  shape (N_valid, Nr-K)
@@ -208,6 +202,15 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
     else:
         spectrum_db = spectrum
 
+    # ── Peak contrast (spectrum sharpness) ────────────────────────────────────
+    # Snapshots are unit-magnitude (exp(jφ)), so the covariance matrix has
+    # trace = Nr always.  For a coherent source this makes λ_min → 0 and any
+    # eigenvalue-ratio SNR blows up to 100+ dB even in noisy conditions.
+    # Instead use peak contrast: how much the peak stands above the average
+    # of the normalised spectrum.  Flat spectrum → 0 dB.  Sharp peak → ~30 dB.
+    #   contrast = 0 dB − mean(spectrum_db)   [peak is always 0 dB after normalisation]
+    snr_db = float(-np.nanmean(spectrum_db))   # higher = sharper/more prominent peak
+
     peak_idx = int(np.argmax(music_vals))
     return spectrum_db, peak_idx, snr_db
 
@@ -222,16 +225,25 @@ class MusicProcessor:
     reader thread; read spectrum / peak from the main (display) thread.
     """
 
-    def __init__(self, A_steer, valid_mask, valid_u, valid_v,
+    def __init__(self, A_steer, valid_mask, valid_u, valid_v, u_scan, v_scan,
                  n_scan, num_sources, n_snapshots, update_every):
         self._A_steer      = A_steer
         self._valid_mask   = valid_mask
         self._valid_u      = valid_u
         self._valid_v      = valid_v
+        self._u_scan       = u_scan   # (n_scan,) linear grid  -1..1
+        self._v_scan       = v_scan
         self._n_scan       = n_scan
         self._num_sources  = num_sources
         self._n_snapshots  = n_snapshots
         self._update_every = update_every
+
+        # Precompute grid step for fast nearest-index lookup
+        self._du = (u_scan[-1] - u_scan[0]) / (len(u_scan) - 1)
+        self._dv = (v_scan[-1] - v_scan[0]) / (len(v_scan) - 1)
+
+        # Fixed cut-resolution (angular samples for 1D pattern cuts)
+        self._N_CUT = 181
 
         # Circular buffer — holds up to 4× the covariance window
         self._buf  = deque(maxlen=n_snapshots * 4)
@@ -245,6 +257,8 @@ class MusicProcessor:
         self.peak_v         = float('nan')
         self.snr_db         = float('nan')
         self.az_el_history  = deque(maxlen=60)   # (phi_deg, theta_deg) trail
+        self.theta_cut_r    = np.zeros(self._N_CUT)   # elevation pattern (0–180°)
+        self.phi_cut_r      = np.zeros(self._N_CUT)   # azimuth pattern  (−90–+90°)
         self.updates        = 0       # number of MUSIC updates completed
         self.snapshots      = 0       # total snapshots received
         self._res_lock      = threading.Lock()
@@ -280,9 +294,67 @@ class MusicProcessor:
                 'peak_v':        self.peak_v,
                 'snr_db':        self.snr_db,
                 'az_el_history': list(self.az_el_history),
+                'theta_cut_r':   self.theta_cut_r.copy(),  # elevation pattern, 0–180°
+                'phi_cut_r':     self.phi_cut_r.copy(),    # azimuth pattern, −90–+90°
                 'updates':       self.updates,
                 'snapshots':     self.snapshots,
             }
+
+    def _uv_idx(self, u_q, v_q):
+        """Return (u_col, v_row) nearest-grid indices for query point (u_q, v_q)."""
+        u_col = int(np.clip(round((u_q - self._u_scan[0]) / self._du), 0, self._n_scan - 1))
+        v_row = int(np.clip(round((v_q - self._v_scan[0]) / self._dv), 0, self._n_scan - 1))
+        return u_col, v_row
+
+    def _compute_cuts(self, spectrum_db, pu, pv, theta_deg, phi_deg):
+        """
+        Compute 1D spectrum cuts through the peak in the θ and φ planes.
+
+        Convention: u = sin(φ),  v = cos(φ)·cos(θ)
+
+        θ cut: fix φ = phi_deg, scan θ from 0° to 180°.
+               At constant φ:  u = sin(φ) is fixed; v = cos(φ)·cos(θ) varies.
+
+        φ cut: fix θ = theta_deg, scan φ from −90° to +90°.
+               At constant θ:  u = sin(φ), v = cos(φ)·cos(θ) — a curve in UV.
+
+        Returns (theta_cut_r, phi_cut_r) each of length self._N_CUT, linear [0,1].
+        """
+        N = self._N_CUT
+        phi_rad  = np.radians(phi_deg)
+        cos_phi  = np.cos(phi_rad)
+        u_fixed  = np.sin(phi_rad)   # constant for the θ cut
+        u_col_th, _ = self._uv_idx(u_fixed, 0.0)
+        spec_col = spectrum_db[u_col_th, :]  # shape (n_scan,) for v axis
+
+        # ── θ cut ──────────────────────────────────────────────────────────────
+        theta_cut_deg = np.linspace(0.0, 180.0, N)
+        v_th = cos_phi * np.cos(np.radians(theta_cut_deg))   # (N,)
+        v_rows = np.clip(
+            np.round((v_th - self._v_scan[0]) / self._dv).astype(int),
+            0, self._n_scan - 1)
+        raw = spec_col[v_rows]
+        # Zero out where v is outside the hemisphere (|v|>cos_phi means edge-on)
+        inside = np.abs(v_th) <= (abs(cos_phi) + 1e-6)
+        theta_cut_r = np.where(inside & ~np.isnan(raw), np.maximum(0.0, 10 ** (raw / 10)), 0.0)
+
+        # ── φ cut ──────────────────────────────────────────────────────────────
+        phi_cut_deg = np.linspace(-90.0, 90.0, N)
+        phi_c_rad = np.radians(phi_cut_deg)
+        cos_th = np.cos(np.radians(theta_deg))
+        u_ph = np.sin(phi_c_rad)                       # (N,)
+        v_ph = np.cos(phi_c_rad) * cos_th              # (N,)
+        in_circle = (u_ph ** 2 + v_ph ** 2) <= 1.0
+        u_cols = np.clip(
+            np.round((u_ph - self._u_scan[0]) / self._du).astype(int),
+            0, self._n_scan - 1)
+        v_rows2 = np.clip(
+            np.round((v_ph - self._v_scan[0]) / self._dv).astype(int),
+            0, self._n_scan - 1)
+        raw2 = spectrum_db[u_cols, v_rows2]
+        phi_cut_r = np.where(in_circle & ~np.isnan(raw2), np.maximum(0.0, 10 ** (raw2 / 10)), 0.0)
+
+        return theta_cut_r, phi_cut_r
 
     def _worker(self):
         last_processed = 0
@@ -314,10 +386,26 @@ class MusicProcessor:
 
             pu = float(self._valid_u[peak_idx])
             pv = float(self._valid_v[peak_idx])
-            uv2 = pu ** 2 + pv ** 2
-            # θ = angle from array normal: 90° = broadside (centre), 0° = edge-on
-            theta = float(np.degrees(np.arccos(np.sqrt(min(uv2, 1.0)))))
-            phi   = float(np.degrees(np.arctan2(pv, pu)))
+
+            # ── New angle convention ─────────────────────────────────────────────
+            # u = sin(φ)             → φ = arcsin(u)            φ ∈ [−90°, +90°]
+            # v = cos(φ)·cos(θ)      → θ = arccos(v/cos(φ))    θ ∈ [0°, 180°]
+            #
+            # Physical meaning:
+            #   φ = azimuth from broadside (left/right); φ=0° = straight ahead
+            #   θ = elevation; 90° = broadside, 0°/180° = along the array plane
+            #
+            # Avoids the arctan2 degeneracy at broadside (u=v=0) that caused
+            # the old formula to bounce between ±45°/±135°.
+            phi_rad = np.arcsin(np.clip(pu, -1.0, 1.0))
+            phi     = float(np.degrees(phi_rad))
+            cos_phi = float(np.cos(phi_rad))
+            if cos_phi > 1e-6:
+                theta = float(np.degrees(np.arccos(np.clip(pv / cos_phi, -1.0, 1.0))))
+            else:
+                theta = 90.0   # φ=±90° edge: θ is undefined, default to broadside
+
+            theta_cut_r, phi_cut_r = self._compute_cuts(spectrum_db, pu, pv, theta, phi)
 
             with self._res_lock:
                 self.spectrum_db = spectrum_db
@@ -326,6 +414,8 @@ class MusicProcessor:
                 self.theta_deg   = theta
                 self.phi_deg     = phi
                 self.snr_db      = snr_db
+                self.theta_cut_r = theta_cut_r
+                self.phi_cut_r   = phi_cut_r
                 self.az_el_history.append((phi, theta))
                 self.updates    += 1
 
@@ -342,29 +432,32 @@ def simulate_snapshots(processor, theta_deg, phi_deg, snr_db, stop_event):
     """
     theta = np.radians(theta_deg)
     phi   = np.radians(phi_deg)
-    # θ = angle from array normal (90° = broadside), so direction cosines use cos(θ)
-    u = np.cos(theta) * np.cos(phi)
-    v = np.cos(theta) * np.sin(phi)
+    # Convention: u = sin(φ),  v = cos(φ)·cos(θ)
+    # φ=0° = broadside (orthogonal to array plane), φ ∈ [-90°,+90°]
+    # θ=90° = broadside, θ ∈ [0°, 180°]
+    u = np.sin(phi)
+    v = np.cos(phi) * np.cos(theta)
 
     # True steering vector
     ax = np.exp(2j * np.pi * d * np.arange(Nx) * u)
     ay = np.exp(2j * np.pi * d * np.arange(Ny) * v)
     a_true = np.kron(ax, ay)   # (Nr,)
 
-    noise_std = 10 ** (-snr_db / 20.0)
+    # Phase noise std (radians).  At unit signal amplitude, σ_phase ≈ σ_amplitude.
+    # Snapshots are pure phase (exp(jφ)), so amplitude noise is discarded by
+    # np.angle().  Model noise directly as additive phase jitter so the
+    # covariance matrix has a meaningful noise floor and SNR reads correctly.
+    phase_noise_std = 10 ** (-snr_db / 20.0)
     rng = np.random.default_rng()
 
     print(f"[sim] Source at θ={theta_deg:.1f}°  φ={phi_deg:.1f}°  "
-          f"u={u:.3f}  v={v:.3f}  SNR={snr_db} dB")
+          f"u={u:.3f}  v={v:.3f}  SNR={snr_db} dB  "
+          f"(phase noise σ={phase_noise_std:.3f} rad)")
+
+    true_phases = np.angle(a_true)   # deterministic per-element phase for this direction
 
     while not stop_event.is_set():
-        # Random complex signal amplitude
-        s = rng.standard_normal() + 1j * rng.standard_normal()
-        noise = noise_std * (rng.standard_normal(Nr) + 1j * rng.standard_normal(Nr))
-        received = a_true * s + noise
-
-        # Extract phase of each element (equivalent to what ESP32s report)
-        phases = np.angle(received).tolist()
+        phases = (true_phases + phase_noise_std * rng.standard_normal(Nr)).tolist()
         processor.push_snapshot(phases)
         time.sleep(0.01)   # ~100 Hz
 
@@ -418,13 +511,22 @@ def _setup_backend(args):
 
 def build_figure(n_scan, vmin_db):
     """Create the matplotlib figure and return handles needed for animation."""
-    import matplotlib.pyplot as plt  # backend must already be set by _setup_backend()
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6),
-                             gridspec_kw={'width_ratios': [3, 2, 1]})
+    import matplotlib.pyplot as plt            # backend must already be set by _setup_backend()
+    import matplotlib.gridspec as gridspec
+
+    fig = plt.figure(figsize=(18, 6))
     fig.patch.set_facecolor('#1a1a2e')
 
+    gs = gridspec.GridSpec(2, 3, figure=fig,
+                           width_ratios=[3, 2, 1],
+                           hspace=0.55, wspace=0.35)
+
+    ax_map   = fig.add_subplot(gs[:, 0])
+    ax_theta = fig.add_subplot(gs[0, 1], projection='polar')
+    ax_phi   = fig.add_subplot(gs[1, 1], projection='polar')
+    ax_info  = fig.add_subplot(gs[:, 2])
+
     # ── Left: 2D MUSIC heatmap ────────────────────────────────────────────────
-    ax_map = axes[0]
     ax_map.set_facecolor('#16213e')
 
     placeholder = np.full((n_scan, n_scan), np.nan)
@@ -459,8 +561,8 @@ def build_figure(n_scan, vmin_db):
 
     ax_map.set_xlim(-1.1, 1.1)
     ax_map.set_ylim(-1.1, 1.1)
-    ax_map.set_xlabel('u = sin(θ)cos(φ)   [azimuth →]', color='white', fontsize=10)
-    ax_map.set_ylabel('v = sin(θ)sin(φ)   [↑ elevation]', color='white', fontsize=10)
+    ax_map.set_xlabel('u = sin(φ)   [← φ=−90°  |  φ=+90° →]', color='white', fontsize=10)
+    ax_map.set_ylabel('v = cos(φ)·cos(θ)   [θ<90° ↑ | ↓ θ>90°]', color='white', fontsize=10)
     ax_map.tick_params(colors='white')
     for spine in ax_map.spines.values():
         spine.set_edgecolor('#555577')
@@ -468,40 +570,55 @@ def build_figure(n_scan, vmin_db):
     title = ax_map.set_title('2D MUSIC — waiting for data...', color='white',
                               fontsize=11, pad=8)
 
-    # ── Middle: az-el direction panel ────────────────────────────────────────
-    ax_azel = axes[1]
-    ax_azel.set_facecolor('#16213e')
-    ax_azel.set_xlim(-180, 180)
-    ax_azel.set_ylim(0, 90)
-    ax_azel.set_xlabel('Azimuth φ (°)', color='white', fontsize=10)
-    ax_azel.set_ylabel('Elevation θ from normal (°)', color='white', fontsize=10)
-    ax_azel.set_title('Direction Estimate', color='white', fontsize=10, pad=6)
-    ax_azel.tick_params(colors='white')
-    ax_azel.set_xticks([-180, -90, 0, 90, 180])
-    ax_azel.set_yticks([0, 30, 60, 90])
-    for spine in ax_azel.spines.values():
-        spine.set_edgecolor('#555577')
+    # ── Middle-top: θ polar — elevation pattern (0° to 180°) ─────────────────
+    # Angle axis = θ:  0° at left (9-o'clock),  90° at top (broadside),  180° at right
+    # Radius axis = normalised MUSIC spectrum [0, 1]  (spectrum cut at peak φ)
+    # Layout: theta_zero_location='W' + CW → 0°=left, 90°=top, 180°=right ✓
+    ax_theta.set_facecolor('#16213e')
+    ax_theta.set_theta_zero_location('W')
+    ax_theta.set_theta_direction(-1)          # clockwise: 0→left, 90→top, 180→right
+    ax_theta.set_thetamin(0)
+    ax_theta.set_thetamax(180)
+    ax_theta.set_rmax(1.05)
+    ax_theta.set_rticks([0.25, 0.5, 0.75, 1.0])
+    ax_theta.set_rlabel_position(135)         # put r-labels inside the arch
+    ax_theta.yaxis.set_tick_params(labelcolor='#888899', labelsize=6)
+    ax_theta.xaxis.set_tick_params(labelcolor='white',   labelsize=7)
+    # Custom tick labels: show θ values instead of raw angle
+    ax_theta.set_thetagrids([0, 30, 60, 90, 120, 150, 180],
+                            labels=['0°', '30°', '60°', '90°\n(boresight)',
+                                    '120°', '150°', '180°'],
+                            color='white', fontsize=6)
+    ax_theta.set_title('θ — elevation pattern', color='white', fontsize=9, pad=8)
 
-    # Grid lines
-    for xv in [-90, 0, 90]:
-        ax_azel.axvline(xv, color='#444466', linewidth=0.6, linestyle=':')
-    for yv in [30, 60, 90]:
-        ax_azel.axhline(yv, color='#444466', linewidth=0.6, linestyle=':')
+    theta_line, = ax_theta.plot([], [], color='cyan',  linewidth=1.5, zorder=3)
+    theta_dot,  = ax_theta.plot([], [], 'r+', markersize=14,
+                                markeredgewidth=2.5, zorder=5)
 
-    # Label key angles
-    ax_azel.text(0, 91, 'boresight', color='#888899', fontsize=7,
-                 ha='center', va='bottom')
-    ax_azel.text(-179, 1, 'left', color='#888899', fontsize=7, ha='left')
-    ax_azel.text(179, 1, 'right', color='#888899', fontsize=7, ha='right')
+    # ── Middle-bottom: φ polar — azimuth pattern (−90° to +90°) ──────────────
+    # Angle axis = φ:  0° at top (boresight),  ±90° at left/right (array edges)
+    # Radius axis = normalised MUSIC spectrum [0, 1]  (spectrum cut at peak θ)
+    # Ground-plane constraint: only front hemisphere visible → semicircle only
+    ax_phi.set_facecolor('#16213e')
+    ax_phi.set_theta_zero_location('N')
+    ax_phi.set_theta_direction(-1)            # CW: −90°=left, 0°=top, +90°=right
+    ax_phi.set_thetamin(-90)
+    ax_phi.set_thetamax(90)
+    ax_phi.set_rmax(1.05)
+    ax_phi.set_rticks([0.25, 0.5, 0.75, 1.0])
+    ax_phi.set_rlabel_position(45)
+    ax_phi.yaxis.set_tick_params(labelcolor='#888899', labelsize=6)
+    ax_phi.xaxis.set_tick_params(labelcolor='white',   labelsize=7)
+    ax_phi.set_thetagrids([-90, -45, 0, 45, 90],
+                          labels=['−90°', '−45°', '0°\n(boresight)', '45°', '90°'],
+                          color='white', fontsize=6)
+    ax_phi.set_title('φ — azimuth pattern', color='white', fontsize=9, pad=8)
 
-    # Trail scatter (fading history) — empty initially
-    az_trail = ax_azel.scatter([], [], s=18, zorder=4)
-
-    # Current estimate marker
-    az_dot, = ax_azel.plot([], [], 'r+', markersize=16, markeredgewidth=2.5, zorder=5)
+    phi_line, = ax_phi.plot([], [], color='cyan',  linewidth=1.5, zorder=3)
+    phi_dot,  = ax_phi.plot([], [], 'r+', markersize=14,
+                            markeredgewidth=2.5, zorder=5)
 
     # ── Right: info panel ─────────────────────────────────────────────────────
-    ax_info = axes[2]
     ax_info.set_facecolor('#16213e')
     ax_info.set_xlim(0, 1)
     ax_info.set_ylim(0, 1)
@@ -530,12 +647,13 @@ def build_figure(n_scan, vmin_db):
                  color='#88aacc', fontsize=7, ha='center', va='center',
                  fontfamily='monospace')
 
-    plt.tight_layout(pad=1.5)
+    fig.tight_layout(pad=1.2)
 
-    return fig, im, peak_dot, title, info_text, az_trail, az_dot
+    return fig, im, peak_dot, title, info_text, theta_line, theta_dot, phi_line, phi_dot
 
 
-def _apply_result(result, im, peak_dot, title_obj, info_text, az_trail, az_dot, args):
+def _apply_result(result, im, peak_dot, title_obj, info_text,
+                  theta_line, theta_dot, phi_line, phi_dot, args):
     """Update all plot artists from a result dict. Returns True if data was ready."""
     spectrum = result['spectrum_db']
     updates  = result['updates']
@@ -555,22 +673,22 @@ def _apply_result(result, im, peak_dot, title_obj, info_text, az_trail, az_dot, 
         bar_filled = int(min(max(snr, 0.0), 30.0) / 30.0 * 10)
         snr_bar = '█' * bar_filled + '░' * (10 - bar_filled)
 
-        # ── Az-el trail ───────────────────────────────────────────────────────
-        history = result['az_el_history']
-        if history:
-            hist_phi   = [p for p, t in history]
-            hist_theta = [t for p, t in history]
-            n = len(history)
-            alphas = np.linspace(0.08, 0.75, n)
-            rgba = np.zeros((n, 4))
-            rgba[:, 0] = 0.35   # R
-            rgba[:, 1] = 0.75   # G
-            rgba[:, 2] = 1.0    # B
-            rgba[:, 3] = alphas
-            az_trail.set_offsets(np.column_stack([hist_phi, hist_theta]))
-            az_trail.set_facecolor(rgba)
-            az_trail.set_edgecolor('none')
-        az_dot.set_data([ph], [th])
+        # ── θ polar: elevation spectrum cut ───────────────────────────────────
+        # angle axis = θ (0→180°),  r = normalised spectrum
+        # theta_zero_location='W', CW → plot at np.radians(θ)
+        N_CUT = len(result['theta_cut_r'])
+        theta_cut_deg = np.linspace(0.0, 180.0, N_CUT)
+        theta_line.set_data(np.radians(theta_cut_deg), result['theta_cut_r'])
+        # Peak marker at the estimated θ
+        theta_dot.set_data([np.radians(th)], [1.0])
+
+        # ── φ polar: azimuth spectrum cut ─────────────────────────────────────
+        # angle axis = φ (−90→+90°),  r = normalised spectrum
+        # theta_zero_location='N', CW → plot at np.radians(φ)
+        phi_cut_deg = np.linspace(-90.0, 90.0, N_CUT)
+        phi_line.set_data(np.radians(phi_cut_deg), result['phi_cut_r'])
+        # Peak marker at the estimated φ
+        phi_dot.set_data([np.radians(ph)], [1.0])
 
         peak_dot.set_data([pu], [pv])
         title_obj.set_text(
@@ -587,7 +705,7 @@ def _apply_result(result, im, peak_dot, title_obj, info_text, az_trail, az_dot, 
             f"\n"
             f"SIGNAL\n"
             f"────────────────\n"
-            f"Array SNR     : {snr:+.1f} dB\n"
+            f"Peak contrast : {snr:+.1f} dB\n"
             f"{snr_bar}  (0–30 dB)\n"
             f"\n"
             f"STATS\n"
@@ -617,7 +735,8 @@ def launch_display(processor, args, stop_event):
     _setup_backend(args)
     import matplotlib.pyplot as plt   # safe to import now
 
-    fig, im, peak_dot, title_obj, info_text, az_trail, az_dot = \
+    fig, im, peak_dot, title_obj, info_text, \
+        theta_line, theta_dot, phi_line, phi_dot = \
         build_figure(args.scan, args.vmin)
 
     if args.save:
@@ -628,7 +747,7 @@ def launch_display(processor, args, stop_event):
             while not stop_event.is_set():
                 result = processor.get_result()
                 _apply_result(result, im, peak_dot, title_obj, info_text,
-                              az_trail, az_dot, args)
+                              theta_line, theta_dot, phi_line, phi_dot, args)
                 fname = f"music_frame_{frame:04d}.png"
                 fig.savefig(fname, dpi=100, facecolor=fig.get_facecolor())
                 print(f"\r[display] Saved {fname}  "
@@ -651,7 +770,7 @@ def launch_display(processor, args, stop_event):
             while not stop_event.is_set():
                 result = processor.get_result()
                 _apply_result(result, im, peak_dot, title_obj, info_text,
-                              az_trail, az_dot, args)
+                              theta_line, theta_dot, phi_line, phi_dot, args)
                 fig.canvas.draw_idle()   # queue redraw
                 plt.pause(0.2)           # pump GUI event loop + execute redraw
                 if not plt.fignum_exists(fig.number):
@@ -809,7 +928,7 @@ def main():
 
     # ── Create MUSIC processor ────────────────────────────────────────────────
     processor = MusicProcessor(
-        A_steer, valid_mask, valid_u, valid_v,
+        A_steer, valid_mask, valid_u, valid_v, u_scan, v_scan,
         n_scan=args.scan,
         num_sources=args.sources,
         n_snapshots=args.snapshots,
