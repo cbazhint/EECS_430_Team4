@@ -19,7 +19,7 @@
 /* ============================================================
    CONFIGURATION - adjust per node before flashing
    ============================================================ */
-#define NODE_ID             0
+#define NODE_ID             6
 #define UART_TX_PIN         17
 #define UART_RX_PIN         18
 #define UART_BAUD           921600
@@ -203,7 +203,7 @@ void loop()
         csi_data_ready = false;
 
         send_csi_packet(phase, ts);
-
+        
         Serial.printf("[Node %d] phase=%.4f rad  amp=%.1f  rssi=%d dBm\n",
                       NODE_ID, phase, amp, rssi);
     }

@@ -23,13 +23,14 @@
  *    ant    - force RF switches to antenna path
  *    nrf    - test nRF24 chip connection
  *
- *  Host packet format (41 bytes, binary, sent during "run" mode):
+ *  Host packet format (42 bytes, binary, sent during "run" mode):
  *    [0]      SYNC_A     0xBB
  *    [1]      SYNC_B     0xCC
  *    [2..3]   seq        uint16 LE  (wraps at 65535)
  *    [4..7]   timestamp  uint32 LE  (Nucleo millis())
  *    [8..39]  phases[8]  float32 LE each  (corrected phase, radians)
- *    [40]     checksum   XOR of bytes [0..39]
+ *    [40]     cal_mask   uint8   bit i = node i has valid calibration
+ *    [41]     checksum   XOR of bytes [0..40]
  *
  *  Pin assignments: see pinconfig.h
  */
@@ -54,7 +55,7 @@ RF24 radio(NRF24_CE_PIN, NRF24_CS_PIN);
 #define CAL_SAMPLES          20    // phase measurements averaged per node
 #define CAL_TIMEOUT_MS      500    // max wait for one packet per sample attempt (ms)
 #define CAL_REFERENCE_NODE    1    // preferred reference node (falls back if no data)
-#define CAL_MIN_SAMPLES       5    // minimum samples to consider a node calibrated
+#define CAL_MIN_SAMPLES       3    // minimum samples to consider a node calibrated
 
 static float   phaseCorrection[NUM_ESP_NODES] = {0.0f};
 static uint8_t calValid = 0x00;    // bitmask: bit i set = node i is calibrated
@@ -192,6 +193,7 @@ void loop() {
         if (cmd == "run") {
             memset(parsers,   0, sizeof(parsers));
             memset(snapFresh, 0, sizeof(snapFresh));
+            memset(snapPhase, 0, sizeof(snapPhase));   // prevent stale/zero phases on first packet
             lastSnapTime = millis();
             streaming = true;
             Serial.println("[CMD] Streaming ON — sending binary host packets");
@@ -226,8 +228,62 @@ void loop() {
             Serial.print("[CMD] nRF24 link: ");
             Serial.println(testNRF24Link() ? "PASS" : "FAIL");
 
+        } else if (cmd == "pintest") {
+            // Cycle through candidate free GPIOs one at a time (2 s each).
+            // Watch the RF switch LED — when it toggles, that is your CTRL pin.
+            // All UART/SPI/LED/debug pins are excluded from the list.
+            const PinName candidates[] = {
+                PF_0, PF_1, PF_2, PF_3, PF_4, PF_5,
+                PG_0, PG_1, PG_2, PG_3, PG_4, PG_5, PG_6, PG_7,
+                PE_2, PE_3, PE_4, PE_5, PE_6,
+                PD_0, PD_1, PD_3, PD_4, PD_5, PD_6, PD_7,
+                PC_8, PC_9, PC_10, PC_11, PC_12,
+                PB_0, PB_1, PB_2, PB_8, PB_9, PB_10, PB_11,
+                NC   // sentinel
+            };
+            bool wasStreaming = streaming;
+            streaming = false;
+            Serial.println("[PINTEST] Toggling candidate pins LOW→HIGH→LOW (2 s each).");
+            Serial.println("          Watch the RF switch LED. Type any key to stop early.");
+            for (int ci = 0; candidates[ci] != NC; ci++) {
+                if (Serial.available()) { Serial.read(); break; }
+                // Print the Arduino pin name via a lookup table
+                char pinName[8];
+                int port = (candidates[ci] >> 4) & 0xF;
+                int num  = candidates[ci] & 0xF;
+                snprintf(pinName, sizeof(pinName), "P%c_%d",
+                         'A' + port, num);
+                Serial.printf("[PINTEST] Testing %-6s ...", pinName);
+                pinMode(candidates[ci], OUTPUT);
+                digitalWrite(candidates[ci], LOW);
+                delay(800);
+                digitalWrite(candidates[ci], HIGH);
+                delay(800);
+                digitalWrite(candidates[ci], LOW);
+                delay(400);
+                pinMode(candidates[ci], INPUT);   // release pin after test
+                Serial.println(" done");
+            }
+            // Restore correct CTRL pin state — antenna path (HIGH)
+            pinMode(RF_SWITCH_CTRL_PIN, OUTPUT);
+            digitalWrite(RF_SWITCH_CTRL_PIN, HIGH);
+            streaming = wasStreaming;
+            Serial.println("[PINTEST] Complete. Update RF_SWITCH_CTRL_PIN in pinconfig.h");
+
+        } else if (cmd == "hi") {
+            // Direct GPIO test — force CTRL pin HIGH right now, no cal involved
+            pinMode(RF_SWITCH_CTRL_PIN, OUTPUT);
+            digitalWrite(RF_SWITCH_CTRL_PIN, HIGH);
+            Serial.printf("[GPIO] PF_1 forced HIGH — measure with multimeter now\n");
+
+        } else if (cmd == "lo") {
+            // Direct GPIO test — force CTRL pin LOW
+            pinMode(RF_SWITCH_CTRL_PIN, OUTPUT);
+            digitalWrite(RF_SWITCH_CTRL_PIN, LOW);
+            Serial.printf("[GPIO] PF_1 forced LOW\n");
+
         } else if (cmd == "help" || cmd == "?") {
-            Serial.println("Commands: run | stop | cal | verify | status | ant | nrf");
+            Serial.println("Commands: run | stop | cal | verify | status | ant | nrf | pintest | hi | lo");
 
         } else if (cmd.length() > 0) {
             Serial.print("[CMD] Unknown: '");
@@ -325,12 +381,15 @@ void tryEmitSnapshot()
 
     bool timedOut = (millis() - lastSnapTime) >= SNAP_TIMEOUT_MS;
 
-    // Send when all nodes fresh, or timeout with partial data, or keepalive
-    // when no ESP32s are connected (anyFresh=false) so Python pipeline can
-    // be tested before hardware is fully wired.
-    if (allFresh || timedOut) {
+    // Send when all nodes fresh, or timeout with at least one fresh node.
+    // Do NOT send when anyFresh=false: all-zero snapPhase[] looks like a
+    // perfect broadside signal and poisons the MUSIC covariance window.
+    if (allFresh || (timedOut && anyFresh)) {
         sendHostPacket();
         memset(snapFresh, false, sizeof(snapFresh));
+        lastSnapTime = millis();
+    } else if (timedOut) {
+        // No nodes ready yet — reset the window timer but send nothing.
         lastSnapTime = millis();
     }
 }
@@ -389,12 +448,10 @@ void initDebugSerial() {
 }
 
 void initRFSwitchGPIO() {
-    // Single GPIO drives all 8 BGS12WN6 CTRL pins simultaneously —
-    // guarantees phase-coherent simultaneous switching.
-    // CTRL=LOW  → RF1 (antenna path)
-    // CTRL=HIGH → RF2 (calibration path via Wilkinson combiner)
+    // CTRL=LOW  → calibration path  (relay closed, cal ESP32 beaconing)
+    // CTRL=HIGH → antenna path      (relay open,   cal ESP32 silent)
     pinMode(RF_SWITCH_CTRL_PIN, OUTPUT);
-    digitalWrite(RF_SWITCH_CTRL_PIN, LOW);
+    digitalWrite(RF_SWITCH_CTRL_PIN, HIGH);   // start on antenna path
     bootStatus.rfSwitch = true;
 }
 
@@ -419,7 +476,9 @@ void initESP32UARTs() {
 }
 
 void setRFSwitch(bool toReference) {
-    digitalWrite(RF_SWITCH_CTRL_PIN, toReference ? HIGH : LOW);
+    // CTRL=LOW  → cal path    (toReference=true)
+    // CTRL=HIGH → antenna     (toReference=false)
+    digitalWrite(RF_SWITCH_CTRL_PIN, toReference ? LOW : HIGH);
 }
 
 // ──────────────────────────────────────────────────────────
@@ -467,15 +526,55 @@ void runCalibration()
 {
     Serial.println("[CAL] ── Calibration start ──────────────────");
 
-    // Assert PF_1 HIGH: simultaneously flips all RF switches to reference path
-    // AND signals the cal ESP32 (DoA-REF) to ramp to 100 Hz frame injection
-    Serial.println("[CAL] RF switches → REFERENCE path (cal ESP32 transmitting)");
+    // Assert CTRL LOW: relay switches to cal path AND cal ESP32 starts beaconing
+    Serial.println("[CAL] CTRL → LOW  (relay settling, cal ESP32 starting...)");
     setRFSwitch(true);
-    delay(100);   // let TX ESP32 ramp up and sensors lock on
 
-    // Flush stale bytes from all UARTs before collecting samples
+    // Relay mechanical settle (~5-20 ms) + cal ESP32 first frame latency (~10 ms)
+    // + CSI pipeline flush on each node (~30 ms).  500 ms is generous headroom.
+    delay(500);
+    Serial.println("[CAL] Relay settled — flushing UART buffers");
+
+    // Flush everything that arrived during the settling window — those measurements
+    // were taken while the RF path was still transitioning.
     for (int i = 0; i < NUM_ESP_NODES; i++)
         while (espSerials[i]->available()) espSerials[i]->read();
+
+    // Discard the first 3 valid packets per node after the flush.  The CSI
+    // pipeline may still be mid-acquisition on the first frame post-transition.
+    Serial.println("[CAL] Discarding first 3 packets per node (pipeline warm-up)...");
+    {
+        int discarded[NUM_ESP_NODES] = {};
+        struct { uint8_t buf[PACKET_SIZE]; int count; } dp[NUM_ESP_NODES];
+        memset(dp, 0, sizeof(dp));
+        uint32_t warmDeadline = millis() + 500;   // 500 ms max for discard pass
+        while (millis() < warmDeadline) {
+            bool allWarmedUp = true;
+            for (int i = 0; i < NUM_ESP_NODES; i++) {
+                if (discarded[i] < 3) allWarmedUp = false;
+                while (espSerials[i]->available()) {
+                    uint8_t b = (uint8_t)espSerials[i]->read();
+                    if (dp[i].count == 0) {
+                        if (b == SYNC_BYTE) { dp[i].buf[0] = b; dp[i].count = 1; }
+                    } else {
+                        dp[i].buf[dp[i].count++] = b;
+                        if (dp[i].count == PACKET_SIZE) {
+                            dp[i].count = 0;
+                            uint8_t chk = 0;
+                            for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= dp[i].buf[j];
+                            if (chk == dp[i].buf[PACKET_SIZE - 1])
+                                discarded[i]++;
+                        }
+                    }
+                }
+            }
+            if (allWarmedUp) break;
+        }
+        Serial.print("[CAL] Warm-up discarded:");
+        for (int i = 0; i < NUM_ESP_NODES; i++)
+            Serial.printf("  N%d:%d", i, discarded[i]);
+        Serial.println();
+    }
 
     double sinSum[NUM_ESP_NODES] = {};
     double cosSum[NUM_ESP_NODES] = {};
@@ -577,8 +676,10 @@ void runCalibration()
                               node, count[node], CAL_MIN_SAMPLES);
     }
 
-    // De-assert PF_1: RF switches back to antenna path
+    // De-assert CTRL: relay switches back to antenna path, cal ESP32 goes silent
     setRFSwitch(false);
+    delay(500);   // relay settle before measurement resumes
+    Serial.println("[CAL] Relay settled — back on antenna path");
     Serial.println("[CAL] RF switches → ANTENNA path");
 
     // Pass 1: compute circular mean for nodes that received data
@@ -656,9 +757,9 @@ void verifyCalibration()
 
     Serial.println("[VER] ── Verification start (2 s) ───────────");
     setRFSwitch(true);
-    delay(100);   // let cal ESP32 ramp up
+    delay(300);   // RF path + CSI pipeline settling (same as runCalibration)
 
-    // Flush stale bytes
+    // Flush settling-window data
     for (int i = 0; i < NUM_ESP_NODES; i++)
         while (espSerials[i]->available()) espSerials[i]->read();
 
