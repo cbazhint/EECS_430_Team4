@@ -19,7 +19,7 @@
 /* ============================================================
    CONFIGURATION - adjust per node before flashing
    ============================================================ */
-#define NODE_ID             6
+#define NODE_ID             4
 #define UART_TX_PIN         17
 #define UART_RX_PIN         18
 #define UART_BAUD           921600
@@ -92,6 +92,16 @@ void IRAM_ATTR csi_rx_callback(void *ctx, wifi_csi_info_t *info)
     csi_timestamp  = ts;
     csi_data_ready = true;
     dbg_cb_ok++;
+
+    // Log frame info for first 5 CSI events
+    // sig_mode: 0=non-HT(DSSS or OFDM), 1=HT(802.11n), 2=VHT(802.11ac)
+    // rate: for non-HT OFDM — 11=6M 15=9M 10=12M 14=18M 9=24M 13=36M 8=48M 12=54M
+    //        DSSS rates are 0-3; if rate>=8 it's OFDM
+    if (dbg_cb_ok <= 5) {
+        ets_printf("[CSI] sig_mode=%d rate=%d len=%d I=%d Q=%d\n",
+                   info->rx_ctrl.sig_mode, info->rx_ctrl.rate,
+                   info->len, imag, real_part);
+    }
 }
 
 /* ============================================================
