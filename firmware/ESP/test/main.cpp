@@ -1,78 +1,61 @@
 /*
- * ESP32-S3 — ESP-NOW Beacon Transmitter
+ * ESP32-S3 — CSI Beacon Transmitter
  *
- * Sends broadcast ESP-NOW frames on a fixed channel.
- * ESP-NOW uses properly formatted 802.11 Action frames which trigger
- * real CSI capture on the receiving nodes (unlike raw esp_wifi_80211_tx
- * which doesn't reliably produce non-zero I/Q values).
+ * Sends UDP broadcast packets from a SoftAP so that sensor nodes see
+ * proper 802.11n HT data frames.  ESP-NOW uses management action frames
+ * which always use non-HT preamble — the CSI engine ignores them.
+ * UDP data frames from an HT-capable AP carry HTLTF in the preamble,
+ * which is what triggers the CSI callback on the receiving nodes.
  *
- * Receiver only needs promiscuous mode + CSI enabled — no ESP-NOW
- * stack required on the receiver side.
+ * No association required on the receiver — promiscuous mode captures
+ * all frames on the channel regardless of BSSID.
  */
 
 #include <WiFi.h>
-#include <esp_now.h>
+#include <WiFiUdp.h>
 #include "esp_wifi.h"
 
-#define WIFI_CHAN       6
-#define TX_INTERVAL_MS  10   // 100 Hz — fast enough for good CSI snapshots
+#define WIFI_CHAN        6
+#define TX_INTERVAL_MS  10      // 100 Hz
+#define UDP_PORT        12345
 
-static uint8_t broadcast_addr[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static WiFiUDP    udp;
+static IPAddress  bcast(192, 168, 4, 255);
+static uint32_t   seq = 0;
 
 void setup()
 {
     Serial.begin(115200);
-    delay(500);   // brief settle — do NOT block on !Serial (no monitor = hang)
+    delay(500);
 
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+    // SoftAP establishes an HT BSS — data frames from this AP use 802.11n
+    // HT mixed-mode preamble which carries HTLTF for CSI extraction.
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("BEACON", nullptr, WIFI_CHAN, 0, 4);
+    delay(200);
 
-    esp_wifi_set_max_tx_power(78);  // 78 = ~19.5 dBm (hardware maximum)
+    esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_wifi_set_max_tx_power(78);   // ~19.5 dBm
 
-    // Lock to the correct channel before ESP-NOW init
-    esp_wifi_set_channel(WIFI_CHAN, WIFI_SECOND_CHAN_NONE);
+    udp.begin(UDP_PORT);
 
-    if (esp_now_init() != ESP_OK)
-    {
-        Serial.println("[TX] ERROR: ESP-NOW init failed");
-        return;
-    }
-
-    // Register broadcast peer
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, broadcast_addr, 6);
-    peer.channel = WIFI_CHAN;
-    peer.encrypt = false;
-
-    if (esp_now_add_peer(&peer) != ESP_OK)
-    {
-        Serial.println("[TX] ERROR: add peer failed");
-        return;
-    }
-
-    Serial.printf("[TX] ESP-NOW beacon on ch%d @ %dHz  max TX power set\n",
-                  WIFI_CHAN, 1000 / TX_INTERVAL_MS);
+    Serial.printf("[TX] UDP beacon ready — ch%d @ %d Hz  IP=%s\n",
+                  WIFI_CHAN, 1000 / TX_INTERVAL_MS,
+                  WiFi.softAPIP().toString().c_str());
 }
 
 void loop()
 {
-    static uint32_t seq = 0;
-
-    // Payload just needs to exist — content doesn't matter for CSI
-    uint8_t data[4];
-    data[0] = 0xDE;               // magic
-    data[1] = 0xAD;
-    data[2] = (seq >> 8) & 0xFF;
-    data[3] =  seq       & 0xFF;
+    uint8_t payload[4] = { 0xDE, 0xAD,
+                           (uint8_t)((seq >> 8) & 0xFF),
+                           (uint8_t)( seq       & 0xFF) };
     seq++;
 
-    esp_err_t result = esp_now_send(broadcast_addr, data, sizeof(data));
+    udp.beginPacket(bcast, UDP_PORT);
+    udp.write(payload, sizeof(payload));
+    udp.endPacket();
 
-    // Only print errors and a heartbeat every 500 packets (~5 s at 100 Hz)
-    if (result != ESP_OK)
-        Serial.printf("[TX] send error: %s\n", esp_err_to_name(result));
-    else if (seq % 100 == 0)
+    if (seq % 500 == 0)
         Serial.printf("[TX] alive — seq=%lu\n", seq);
 
     delay(TX_INTERVAL_MS);
