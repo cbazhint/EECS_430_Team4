@@ -37,6 +37,13 @@
 // Snapshot assembly window — send after this many ms even if not all nodes reported
 #define SNAP_TIMEOUT_MS     50
 
+// Maximum allowed age spread (ms) within one snapshot.
+// Nodes whose measurement arrived more than this many ms before the most
+// recent node in the same window are from an older beacon frame and are
+// discarded so they don't corrupt relative-phase coherence.
+// Must be < cal-TX beacon interval (5 ms) to guarantee same-frame grouping.
+#define SNAP_SYNC_MS        4
+
 // nRF24L01+ calibration channel
 // nRF channel N = (2400 + N) MHz → WiFi ch 6 (2437 MHz) = nRF ch 37
 // Must match WIFI_CHANNEL in ESP32 firmware

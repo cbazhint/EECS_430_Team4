@@ -67,7 +67,7 @@ COMMAND-LINE OPTIONS
   --snapshots N     Covariance window size (default: 64)
   --update N        Recompute MUSIC every N new snapshots (default: 16)
   --scan N          u-v grid resolution, N×N points (default: 100)
-  --vmin DB         Heatmap lower colour limit in dB (default: -30)
+  --vmin DB         Heatmap lower colour limit in dB re noise floor (default: -5)
   --simulate        Generate synthetic data instead of using serial
   --theta DEG       Simulated source elevation angle (default: 30)
   --phi   DEG       Simulated source azimuth angle   (default: 45)
@@ -168,11 +168,11 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
     Returns
     -------
     spectrum_db : (n_scan, n_scan) float  — MUSIC pseudo-spectrum in dB,
-                  normalized to 0 dB peak. NaN outside the unit circle.
+                  normalized so noise floor ≈ 0 dB.  Signal peak is positive dB
+                  above noise floor.  NaN outside the unit circle.
     peak_idx : int  — flat index into valid_mask for the peak point.
-    snr_db : float  — array SNR estimate in dB: ratio of largest to smallest
-                      eigenvalue of R.  Higher = stronger / more coherent signal.
-                      Not calibrated to absolute dBm; useful for relative comparison.
+    snr_db : float  — peak dB above noise floor (median-based noise estimate).
+                      0 dB = noise-floor level.  >10 dB = strong signal.
     """
     N = snapshot_matrix.shape[1]
 
@@ -195,21 +195,17 @@ def run_music(snapshot_matrix, A_steer, valid_mask, n_scan, num_sources):
     spectrum = np.full((n_scan, n_scan), np.nan, dtype=np.float32)
     spectrum[valid_mask] = music_vals
 
-    # Normalize to dB relative to peak
-    peak = np.nanmax(spectrum)
-    if peak > 0:
-        spectrum_db = 10.0 * np.log10(spectrum / peak)
+    # Normalize to dB relative to noise floor.
+    # Median of all valid MUSIC values ≈ noise floor: signal occupies <5% of
+    # the UV hemisphere, so the median sits firmly in the noise.
+    # Result: noise ≈ 0 dB everywhere, signal peak = +N dB above noise floor.
+    noise_floor = float(np.median(music_vals))
+    if noise_floor > 0:
+        spectrum_db = 10.0 * np.log10(spectrum / noise_floor)
     else:
         spectrum_db = spectrum
 
-    # ── Peak contrast (spectrum sharpness) ────────────────────────────────────
-    # Snapshots are unit-magnitude (exp(jφ)), so the covariance matrix has
-    # trace = Nr always.  For a coherent source this makes λ_min → 0 and any
-    # eigenvalue-ratio SNR blows up to 100+ dB even in noisy conditions.
-    # Instead use peak contrast: how much the peak stands above the average
-    # of the normalised spectrum.  Flat spectrum → 0 dB.  Sharp peak → ~30 dB.
-    #   contrast = 0 dB − mean(spectrum_db)   [peak is always 0 dB after normalisation]
-    snr_db = float(-np.nanmean(spectrum_db))   # higher = sharper/more prominent peak
+    snr_db = float(np.nanmax(spectrum_db))   # peak dB above noise floor
 
     peak_idx = int(np.argmax(music_vals))
     return spectrum_db, peak_idx, snr_db
@@ -273,12 +269,22 @@ class MusicProcessor:
         self._stop_event.set()
         self._thread.join(timeout=3)
 
-    def push_snapshot(self, phases: list):
+    def push_snapshot(self, phases: list, cal_mask: int = 0xFF):
         """
-        Accept one 8-element phase list from the serial reader and convert it
-        to a complex snapshot vector exp(1j * phases).
+        Accept one 8-element phase list and an 8-bit calibration mask.
+
+        Calibrated nodes (bit i set) contribute exp(1j*phase[i]).
+        Uncalibrated/dead nodes contribute 0+0j — zero amplitude, not the
+        unit-amplitude phasor exp(1j*0)=1+0j.  The distinction matters: a
+        dead node at a non-reference position (e.g. node 7 at col=1, row=3)
+        with forced phase=0 adds a spurious broadside term to the covariance
+        matrix.  Zero amplitude removes it entirely.
         """
-        sv = np.exp(1j * np.array(phases, dtype=np.float32))
+        sv = np.array(
+            [np.exp(1j * float(p)) if (cal_mask >> i) & 1 else 0.0+0.0j
+             for i, p in enumerate(phases)],
+            dtype=np.complex64,
+        )
         with self._lock:
             self._buf.append(sv)
             self.snapshots += 1
@@ -353,6 +359,14 @@ class MusicProcessor:
             0, self._n_scan - 1)
         raw2 = spectrum_db[u_cols, v_rows2]
         phi_cut_r = np.where(in_circle & ~np.isnan(raw2), np.maximum(0.0, 10 ** (raw2 / 10)), 0.0)
+
+        # Normalize cuts to [0, 1] for polar plot r-axis.
+        # With noise-floor normalization the peak can be >> 1 dB in linear scale;
+        # the polar plots only show relative pattern shape so we normalize here.
+        pk_th = float(np.max(theta_cut_r)) if np.any(theta_cut_r > 0) else 1.0
+        pk_ph = float(np.max(phi_cut_r))   if np.any(phi_cut_r  > 0) else 1.0
+        theta_cut_r = theta_cut_r / pk_th
+        phi_cut_r   = phi_cut_r   / pk_ph
 
         return theta_cut_r, phi_cut_r
 
@@ -537,11 +551,11 @@ def build_figure(n_scan, vmin_db):
         aspect='equal',
         cmap='plasma',
         vmin=vmin_db,
-        vmax=0,
+        vmax=10,   # updated dynamically to peak_db on first result
         interpolation='bilinear',
     )
     cb = plt.colorbar(im, ax=ax_map, fraction=0.046, pad=0.04)
-    cb.set_label('dB  (normalized to peak)', color='white', fontsize=9)
+    cb.set_label('dB above noise floor', color='white', fontsize=9)
     cb.ax.yaxis.set_tick_params(color='white')
     plt.setp(cb.ax.yaxis.get_ticklabels(), color='white')
 
@@ -661,15 +675,16 @@ def _apply_result(result, im, peak_dot, title_obj, info_text,
 
     if updates > 0:
         im.set_data(spectrum.T)   # transpose: imshow rows=y, cols=x
-        im.set_clim(vmin=args.vmin, vmax=0)
+        # vmax tracks the current peak so the colour scale always saturates at the peak
+        snr = result['snr_db']
+        im.set_clim(vmin=args.vmin, vmax=max(3.0, snr))
 
         pu = result['peak_u']
         pv = result['peak_v']
         th = result['theta_deg']
         ph = result['phi_deg']
 
-        snr = result['snr_db']
-        # Visual bar: 0 dB = no signal, ~30 dB = strong. Clamp to [0, 30].
+        # Visual bar: 0 dB = at noise floor, ~30 dB = strong. Clamp to [0, 30].
         bar_filled = int(min(max(snr, 0.0), 30.0) / 30.0 * 10)
         snr_bar = '█' * bar_filled + '░' * (10 - bar_filled)
 
@@ -692,7 +707,8 @@ def _apply_result(result, im, peak_dot, title_obj, info_text,
 
         peak_dot.set_data([pu], [pv])
         title_obj.set_text(
-            f'2D MUSIC — 2×4 array   θ = {th:.1f}°   φ = {ph:.1f}°   SNR {snr:.1f} dB'
+            f'2D MUSIC — 2×4 array   θ = {th:.1f}°   φ = {ph:.1f}°   '
+            f'peak {snr:.1f} dB above noise'
         )
         info_text.set_text(
             f"ESTIMATE\n"
@@ -705,7 +721,7 @@ def _apply_result(result, im, peak_dot, title_obj, info_text,
             f"\n"
             f"SIGNAL\n"
             f"────────────────\n"
-            f"Peak contrast : {snr:+.1f} dB\n"
+            f"Above noise   : {snr:+.1f} dB\n"
             f"{snr_bar}  (0–30 dB)\n"
             f"\n"
             f"STATS\n"
@@ -795,6 +811,11 @@ def run_calibration(port, baudrate, timeout_s=60):
     afterwards.  Returns True on success, False on timeout or error.
     """
     import serial as _serial
+    from serialRead import auto_detect_port as _adet
+    if port == '/dev/ttyACM0' or port == '/dev/ttyACM1':
+        detected = _adet()
+        if detected:
+            port = detected
     print(f"[cal] Opening {port} for calibration sequence...")
     try:
         ser = _serial.Serial(port, baudrate, timeout=1)
@@ -833,6 +854,32 @@ def run_calibration(port, baudrate, timeout_s=60):
     return success
 
 
+def stdin_commander(ns, stop_event):
+    """
+    Read lines from stdin and forward them as commands to the Nucleo.
+    Runs in a daemon thread so the user can type commands (cal, run, stop,
+    status, verify) in the same terminal while the visualizer is open —
+    no separate serial monitor needed.
+    """
+    valid = {'run', 'stop', 'cal', 'status', 'verify', 'ant', 'nrf', 'hi', 'lo'}
+    while not stop_event.is_set():
+        try:
+            line = input()
+        except EOFError:
+            break
+        cmd = line.strip()
+        if not cmd:
+            continue
+        if cmd not in valid:
+            print(f"[cmd] Unknown command '{cmd}'.  Valid: {', '.join(sorted(valid))}")
+            continue
+        ns.send_command(cmd)
+        print(f"[cmd] → '{cmd}' sent to Nucleo")
+        if cmd == 'cal':
+            print("[cmd]   Calibration running — MUSIC will pause until streaming resumes.")
+            print("[cmd]   Watch the terminal for [CAL] output from the Nucleo.")
+
+
 def serial_bridge(ns, processor, stop_event):
     """
     Pull snapshots from NucleoSerial and push into the MUSIC processor.
@@ -851,15 +898,11 @@ def serial_bridge(ns, processor, stop_event):
 
         phases   = snap['phases']
         cal_mask = snap.get('cal_mask', 0xFF)   # default all-valid if key absent
-
-        # Zero out phases for uncalibrated nodes so they don't corrupt the array
-        # response.  exp(1j*0) = 1+0j which contributes a flat phase — less bad
-        # than a random hardware offset, and the SNR will reflect the reduced array.
-        masked = [p if (cal_mask >> i) & 1 else 0.0 for i, p in enumerate(phases)]
-        processor.push_snapshot(masked)
+        processor.push_snapshot(phases, cal_mask)
         count += 1
         if count <= 5 or count % 50 == 0:
-            print(f"[bridge] pkt #{count}  seq={snap['seq']}  phases={[f'{p:.2f}' for p in snap['phases']]}")
+            print(f"[bridge] pkt #{count}  seq={snap['seq']}  cal_mask=0x{cal_mask:02X}  "
+                  f"phases={[f'{p:.2f}' for p in snap['phases']]}")
         last_report = time.time()
     print(f"[bridge] Serial bridge stopped. Total packets: {count}")
 
@@ -885,8 +928,8 @@ def parse_args():
                    help='Recompute MUSIC every N new snapshots (default: 16)')
     p.add_argument('--scan',      type=int, default=100,
                    help='u-v grid resolution (default: 100)')
-    p.add_argument('--vmin',      type=float, default=-30,
-                   help='Heatmap lower colour limit in dB (default: -30)')
+    p.add_argument('--vmin',      type=float, default=-5,
+                   help='Heatmap lower colour limit in dB re noise floor (default: -5)')
     p.add_argument('--simulate',  action='store_true',
                    help='Generate synthetic data (no hardware needed)')
     p.add_argument('--theta',     type=float, default=30,
@@ -977,11 +1020,25 @@ def main():
         )
         bridge_thread.start()
 
+        cmd_thread = threading.Thread(
+            target=stdin_commander,
+            args=(ns, stop_event),
+            daemon=True,
+        )
+        cmd_thread.start()
+
     # ── Launch display (blocks until window closed or Ctrl+C) ────────────────
     print(f"[init] Starting display  "
           f"(window={args.snapshots} snaps, K={args.sources} sources, "
           f"grid={args.scan}×{args.scan})")
-    print("[init] Close the plot window or press Ctrl+C to exit.\n")
+    print("[init] Close the plot window or press Ctrl+C to exit.")
+    if not args.simulate:
+        print("[init] Type Nucleo commands here and press Enter:")
+        print("[init]   cal     — re-run calibration (streaming auto-resumes)")
+        print("[init]   run     — start/restart streaming")
+        print("[init]   stop    — halt streaming")
+        print("[init]   status  — print boot diagnostics + correction vector")
+        print("[init]   verify  — re-verify calibration\n")
 
     try:
         launch_display(processor, args, stop_event)

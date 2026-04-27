@@ -34,15 +34,44 @@ Usage:
 """
 
 import serial
+import serial.tools.list_ports
 import struct
 import threading
 import queue
 import time
 
 # ── Serial configuration ──────────────────────────────────────────────────────
-PORT     = '/dev/ttyACM0'   # Linux/WSL ST-Link VCP. Windows: 'COM3', etc.
+PORT     = '/dev/ttyACM1'   # fallback if auto-detect finds nothing
 BAUDRATE = 115200
 TIMEOUT  = 1                # serial read timeout (seconds)
+
+
+def auto_detect_port() -> str | None:
+    """
+    Scan connected serial ports and return the first that looks like an
+    ST-Link VCP (used by Nucleo boards).
+
+    Matches on:
+      - VID 0x0483 (STMicroelectronics) with PID 0x5740 (VCP class)
+      - Description containing 'STLink' or 'ST-Link'
+      - /dev/ttyACM* on Linux / WSL
+      - COMx on Windows (description check only)
+
+    Returns the port string (e.g. '/dev/ttyACM0' or 'COM5'), or None.
+    """
+    candidates = []
+    for p in serial.tools.list_ports.comports():
+        desc = (p.description or '').lower()
+        vid  = p.vid
+        pid  = p.pid
+        # ST-Link VCP: VID=0x0483, PID=0x5740
+        if (vid == 0x0483 and pid == 0x5740):
+            candidates.insert(0, p.device)   # highest priority
+        elif 'stlink' in desc or 'st-link' in desc or 'nucleo' in desc:
+            candidates.append(p.device)
+        elif p.device.startswith('/dev/ttyACM'):
+            candidates.append(p.device)      # last resort on Linux
+    return candidates[0] if candidates else None
 
 # ── Host packet constants ─────────────────────────────────────────────────────
 HOST_SYNC_A   = 0xBB
@@ -182,6 +211,13 @@ class NucleoSerial:
     """
 
     def __init__(self, port: str = PORT, baudrate: int = BAUDRATE):
+        if port is None or port == PORT:
+            detected = auto_detect_port()
+            if detected and detected != port:
+                print(f"[serial] Auto-detected ST-Link VCP on {detected}")
+                port = detected
+            elif detected is None:
+                print(f"[serial] WARNING: No ST-Link VCP found — trying {port}")
         self.ser     = serial.Serial(port=port, baudrate=baudrate, timeout=TIMEOUT)
         self.ser.dtr = False   # prevent DTR toggling from resetting the Nucleo on open
         self.ser.rts = False

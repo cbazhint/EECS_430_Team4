@@ -52,7 +52,7 @@ RF24 radio(NRF24_CE_PIN, NRF24_CS_PIN);
 // ──────────────────────────────────────────────────────────
 //  Calibration configuration
 // ──────────────────────────────────────────────────────────
-#define CAL_SAMPLES          20    // phase measurements averaged per node
+#define CAL_SAMPLES          100    // phase measurements averaged per node
 #define CAL_TIMEOUT_MS      500    // max wait for one packet per sample attempt (ms)
 #define CAL_REFERENCE_NODE    1    // preferred reference node (falls back if no data)
 #define CAL_MIN_SAMPLES       3    // minimum samples to consider a node calibrated
@@ -70,9 +70,10 @@ static bool    calDone  = false;
 // ──────────────────────────────────────────────────────────
 struct NodeParser {
     uint8_t  buf[PACKET_SIZE];
-    int      count;     // bytes buffered (0 = hunting for sync)
-    bool     has_data;  // true when a validated packet is ready
-    float    phase;     // most recent validated phase (raw, uncorrected)
+    int      count;      // bytes buffered (0 = hunting for sync)
+    bool     has_data;   // true when a validated packet is ready
+    float    phase;      // most recent validated phase (raw, uncorrected)
+    uint32_t recv_time;  // Nucleo millis() when has_data was set
 };
 static NodeParser parsers[NUM_ESP_NODES];
 
@@ -84,8 +85,9 @@ static NodeParser parsers[NUM_ESP_NODES];
 //  either when all 8 nodes have reported fresh data, or after
 //  SNAP_TIMEOUT_MS from the previous snapshot (whichever comes first).
 // ──────────────────────────────────────────────────────────
-static float    snapPhase[NUM_ESP_NODES];   // corrected phases for current snapshot
-static bool     snapFresh[NUM_ESP_NODES];   // which nodes have new data this window
+static float    snapPhase[NUM_ESP_NODES];     // corrected phases for current snapshot
+static bool     snapFresh[NUM_ESP_NODES];     // which nodes have new data this window
+static uint32_t snapFreshTime[NUM_ESP_NODES]; // when each node's fresh data arrived
 static uint32_t lastSnapTime = 0;
 static uint16_t snapSeq      = 0;
 static bool     streaming    = false;
@@ -104,7 +106,7 @@ void runCalibration();
 void verifyCalibration();
 void feedParsers();
 void tryEmitSnapshot();
-void sendHostPacket();
+void sendHostPacket(uint8_t fresh_mask);
 void printBootBanner();
 void printBootDiagnostics();
 
@@ -141,10 +143,11 @@ struct BootStatus {
 //  SETUP
 // ══════════════════════════════════════════════════════════
 void setup() {
-    memset(&bootStatus, 0, sizeof(bootStatus));
-    memset(parsers,     0, sizeof(parsers));
-    memset(snapFresh,   0, sizeof(snapFresh));
-    memset(snapPhase,   0, sizeof(snapPhase));
+    memset(&bootStatus,  0, sizeof(bootStatus));
+    memset(parsers,      0, sizeof(parsers));
+    memset(snapFresh,    0, sizeof(snapFresh));
+    memset(snapFreshTime,0, sizeof(snapFreshTime));
+    memset(snapPhase,    0, sizeof(snapPhase));
     uint32_t bootStart = millis();
 
     initDebugSerial();
@@ -191,9 +194,10 @@ void loop() {
         cmd.trim();
 
         if (cmd == "run") {
-            memset(parsers,   0, sizeof(parsers));
-            memset(snapFresh, 0, sizeof(snapFresh));
-            memset(snapPhase, 0, sizeof(snapPhase));   // prevent stale/zero phases on first packet
+            memset(parsers,       0, sizeof(parsers));
+            memset(snapFresh,     0, sizeof(snapFresh));
+            memset(snapFreshTime, 0, sizeof(snapFreshTime));
+            memset(snapPhase,     0, sizeof(snapPhase));
             lastSnapTime = millis();
             streaming = true;
             Serial.println("[CMD] Streaming ON — sending binary host packets");
@@ -207,8 +211,9 @@ void loop() {
             streaming = false;
             runCalibration();
             if (wasStreaming) {
-                memset(parsers,   0, sizeof(parsers));
-                memset(snapFresh, 0, sizeof(snapFresh));
+                memset(parsers,       0, sizeof(parsers));
+                memset(snapFresh,     0, sizeof(snapFresh));
+                memset(snapFreshTime, 0, sizeof(snapFreshTime));
                 lastSnapTime = millis();
                 streaming = true;
                 Serial.println("[CMD] Streaming resumed after cal");
@@ -331,7 +336,8 @@ void feedParsers()
                     if (chk == p.buf[PACKET_SIZE - 1]) {
                         // Extract phase from bytes [6..9]
                         memcpy(&p.phase, &p.buf[6], sizeof(float));
-                        p.has_data = true;
+                        p.recv_time = (uint32_t)millis();
+                        p.has_data  = true;
                     }
                     // Bad checksum: silently drop and re-hunt
                 }
@@ -351,24 +357,35 @@ void feedParsers()
 }
 
 // ──────────────────────────────────────────────────────────
-//  tryEmitSnapshot — assemble one host packet per window
+//  tryEmitSnapshot — assemble one coherent host packet per window
 //
-//  Harvests fresh phases from completed parsers, applies
-//  calibration correction, then emits a host packet when either:
-//    a) all 8 nodes have fresh data, or
+//  Harvests fresh phases from completed parsers, applies calibration
+//  correction, records per-node arrival times, then emits when either:
+//    a) all nodes have fresh data (fast path — same-frame guaranteed), or
 //    b) SNAP_TIMEOUT_MS has elapsed and at least one node reported.
 //
-//  Nodes that did not report in this window keep their previous
-//  corrected phase value (stale but better than NaN for MUSIC).
+//  COHERENCE FILTER (applied on the timeout path):
+//  WiFi CSI phase = hardware_offset + φ_c, where φ_c is a random carrier
+//  phase that changes every transmitted frame.  φ_c is the SAME for all
+//  nodes receiving the same beacon frame, so it cancels in inter-element
+//  differences — but only if every node in the snapshot came from the
+//  SAME frame.  Nodes whose most recent data arrived more than
+//  SNAP_SYNC_MS before the freshest node are from an earlier beacon frame
+//  (different φ_c) and are excluded from the emitted snapshot.
 // ──────────────────────────────────────────────────────────
 void tryEmitSnapshot()
 {
-    // Harvest any fresh parser results
+    // Harvest fresh parser results, recording per-node Nucleo arrival time.
+    // Wrap corrected phase to [-π, π]: raw ∈ [-π,π] + correction ∈ [-π,π]
+    // can reach ±2π.  exp(j*x) is 2π-periodic so MUSIC is unaffected, but
+    // direct scalar comparisons (verify residual, debug prints) need [-π, π].
     for (int i = 0; i < NUM_ESP_NODES; i++) {
         if (parsers[i].has_data) {
-            snapPhase[i]        = parsers[i].phase + phaseCorrection[i];
-            snapFresh[i]        = true;
-            parsers[i].has_data = false;
+            float ph             = parsers[i].phase + phaseCorrection[i];
+            snapPhase[i]         = atan2f(sinf(ph), cosf(ph));   // wrap to [-π, π]
+            snapFreshTime[i]     = parsers[i].recv_time;
+            snapFresh[i]         = true;
+            parsers[i].has_data  = false;
         }
     }
 
@@ -381,17 +398,36 @@ void tryEmitSnapshot()
 
     bool timedOut = (millis() - lastSnapTime) >= SNAP_TIMEOUT_MS;
 
-    // Send when all nodes fresh, or timeout with at least one fresh node.
-    // Do NOT send when anyFresh=false: all-zero snapPhase[] looks like a
-    // perfect broadside signal and poisons the MUSIC covariance window.
-    if (allFresh || (timedOut && anyFresh)) {
-        sendHostPacket();
-        memset(snapFresh, false, sizeof(snapFresh));
-        lastSnapTime = millis();
-    } else if (timedOut) {
-        // No nodes ready yet — reset the window timer but send nothing.
-        lastSnapTime = millis();
+    if (!allFresh && !(timedOut && anyFresh)) {
+        if (timedOut) lastSnapTime = millis();   // nothing to send, just reset
+        return;
     }
+
+    // Find the most recent arrival among fresh nodes
+    uint32_t maxTime = 0;
+    for (int i = 0; i < NUM_ESP_NODES; i++)
+        if (snapFresh[i] && snapFreshTime[i] > maxTime)
+            maxTime = snapFreshTime[i];
+
+    // Build coherent fresh mask: exclude nodes whose data arrived more than
+    // SNAP_SYNC_MS before the newest arrival (they're from an older beacon
+    // frame with a different random carrier phase φ_c).
+    // Fast path (allFresh): all nodes fresh together — skip filter, use 0xFF.
+    uint8_t fresh_bits = 0;
+    if (allFresh) {
+        fresh_bits = 0xFF;
+    } else {
+        for (int i = 0; i < NUM_ESP_NODES; i++) {
+            if (snapFresh[i] && (maxTime - snapFreshTime[i]) <= SNAP_SYNC_MS)
+                fresh_bits |= (1 << i);
+        }
+    }
+
+    if (fresh_bits != 0)
+        sendHostPacket(fresh_bits);
+
+    memset(snapFresh, false, sizeof(snapFresh));
+    lastSnapTime = millis();
 }
 
 // ──────────────────────────────────────────────────────────
@@ -405,7 +441,7 @@ void tryEmitSnapshot()
 //    [8..39]  phases[8]   float32 LE each (calibration-corrected)
 //    [40]     checksum    XOR of bytes [0..39]
 // ──────────────────────────────────────────────────────────
-void sendHostPacket()
+void sendHostPacket(uint8_t fresh_mask)
 {
     uint8_t  pkt[HOST_PKT_SIZE];
     uint32_t ts = millis();
@@ -427,7 +463,12 @@ void sendHostPacket()
         pkt[8 + i*4 + 3] = fb[3];
     }
 
-    pkt[40] = calValid;   // calibration validity bitmask — bit i = node i calibrated
+    // When calibration has run: only pass nodes that are calibrated AND fresh.
+    // When calibration hasn't run yet: pass all fresh nodes with raw phases
+    // (phaseCorrection is all-zero, so "uncorrected" = same as "corrected with 0").
+    // Without this fallback, calValid=0 zeros every node → MUSIC sees a zero
+    // covariance matrix → peak is completely random (causes observed hopping).
+    pkt[40] = calDone ? (calValid & fresh_mask) : fresh_mask;
 
     uint8_t chk = 0;
     for (int i = 0; i < HOST_PKT_SIZE - 1; i++) chk ^= pkt[i];
@@ -576,31 +617,46 @@ void runCalibration()
         Serial.println();
     }
 
-    double sinSum[NUM_ESP_NODES] = {};
-    double cosSum[NUM_ESP_NODES] = {};
-    int    count[NUM_ESP_NODES]  = {};
+    // Accumulate per-pair relative phases: delta_i = phase_i - phase_ref.
+    // Carrier phase is common to all nodes on the same frame and cancels
+    // in the difference, leaving only the hardware offset.
+    //
+    // Strategy: when the reference node gets a fresh packet, pair it with
+    // every other node that also has a fresh packet within SNAP_SYNC_MS.
+    // Dead nodes (nodes 0, 7, etc.) are simply never fresh and never
+    // accumulate samples — they don't block calibration of alive nodes.
+    double sinDiff[NUM_ESP_NODES] = {};
+    double cosDiff[NUM_ESP_NODES] = {};
+    int    count[NUM_ESP_NODES]   = {};
+    bool   alive[NUM_ESP_NODES]   = {};   // set on first valid packet
 
-    // Poll all nodes simultaneously so no UART FIFO starves while waiting
-    // for another node.  At 100 Hz cal rate, CAL_SAMPLES×10ms per node = 200ms
-    // of useful data; give 3× headroom for slow nodes.
-    uint32_t calDeadline = millis() + (CAL_SAMPLES * 30UL * NUM_ESP_NODES);
-
-    // Local per-node packet parsers (independent of main feedParsers state)
-    struct { uint8_t buf[PACKET_SIZE]; int count; } cp[NUM_ESP_NODES];
+    struct {
+        uint8_t  buf[PACKET_SIZE];
+        int      count;
+        float    phase;
+        bool     fresh;
+        uint32_t time;
+    } cp[NUM_ESP_NODES];
     memset(cp, 0, sizeof(cp));
 
-    Serial.printf("[CAL] Collecting %d samples per node (round-robin)...\n", CAL_SAMPLES);
+    uint32_t calDeadline = millis() + (CAL_SAMPLES * 30UL * NUM_ESP_NODES);
+
+    Serial.printf("[CAL] Collecting %d samples per node (ref=node %d, pair-wise sync)...\n",
+                  CAL_SAMPLES, CAL_REFERENCE_NODE);
 
     while (millis() < calDeadline)
     {
-        bool allDone = true;
-        for (int i = 0; i < NUM_ESP_NODES; i++)
-            if (count[i] < CAL_SAMPLES) { allDone = false; break; }
-        if (allDone) break;
+        // Early exit once all alive nodes have enough samples
+        if (alive[CAL_REFERENCE_NODE]) {
+            bool allDone = true;
+            for (int i = 0; i < NUM_ESP_NODES; i++)
+                if (alive[i] && count[i] < CAL_SAMPLES) { allDone = false; break; }
+            if (allDone) break;
+        }
 
+        // Feed bytes into local parsers for all nodes simultaneously
         for (int i = 0; i < NUM_ESP_NODES; i++)
         {
-            if (count[i] >= CAL_SAMPLES) continue;
             while (espSerials[i]->available())
             {
                 uint8_t b = (uint8_t)espSerials[i]->read();
@@ -613,16 +669,46 @@ void runCalibration()
                         uint8_t chk = 0;
                         for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= cp[i].buf[j];
                         if (chk == cp[i].buf[PACKET_SIZE - 1]) {
-                            float raw;
-                            memcpy(&raw, &cp[i].buf[6], sizeof(float));
-                            sinSum[i] += sin((double)raw);
-                            cosSum[i] += cos((double)raw);
-                            count[i]++;
+                            memcpy(&cp[i].phase, &cp[i].buf[6], sizeof(float));
+                            cp[i].time  = (uint32_t)millis();
+                            cp[i].fresh = true;
+                            alive[i]    = true;
                         }
                     }
                 }
             }
         }
+
+        // When reference is fresh, pair it with every other fresh node
+        // that arrived within SNAP_SYNC_MS (same beacon frame).
+        // Dead nodes are never fresh, so they never block this.
+        if (!cp[CAL_REFERENCE_NODE].fresh) continue;
+
+        uint32_t refTime  = cp[CAL_REFERENCE_NODE].time;
+        float    refPhase = cp[CAL_REFERENCE_NODE].phase;
+
+        for (int i = 0; i < NUM_ESP_NODES; i++) {
+            if (i == CAL_REFERENCE_NODE) continue;
+            if (!cp[i].fresh) continue;
+
+            uint32_t dt = cp[i].time > refTime ? cp[i].time - refTime
+                                               : refTime  - cp[i].time;
+            if (dt > SNAP_SYNC_MS) {
+                cp[i].fresh = false;  // from a different frame, discard
+                continue;
+            }
+            if (count[i] < CAL_SAMPLES) {
+                float delta = cp[i].phase - refPhase;
+                sinDiff[i] += sin((double)delta);
+                cosDiff[i] += cos((double)delta);
+                count[i]++;
+            }
+            cp[i].fresh = false;
+        }
+        // Count this reference packet and release it
+        if (count[CAL_REFERENCE_NODE] < CAL_SAMPLES)
+            count[CAL_REFERENCE_NODE]++;
+        cp[CAL_REFERENCE_NODE].fresh = false;
     }
 
     for (int node = 0; node < NUM_ESP_NODES; node++)
@@ -635,10 +721,7 @@ void runCalibration()
         if (count[i] < CAL_MIN_SAMPLES) failedCount++;
 
     if (failedCount > 0) {
-        Serial.printf("[CAL] %d node(s) below threshold (%d samples) — retry (2 s)...\n",
-                      failedCount, CAL_MIN_SAMPLES);
-
-        // Flush then collect for 2 more seconds, only targeting failed nodes
+        Serial.printf("[CAL] %d node(s) below threshold — retry (2 s)...\n", failedCount);
         for (int i = 0; i < NUM_ESP_NODES; i++)
             while (espSerials[i]->available()) espSerials[i]->read();
         memset(cp, 0, sizeof(cp));
@@ -646,7 +729,6 @@ void runCalibration()
         uint32_t retryDeadline = millis() + 2000;
         while (millis() < retryDeadline) {
             for (int i = 0; i < NUM_ESP_NODES; i++) {
-                if (count[i] >= CAL_MIN_SAMPLES) continue;
                 while (espSerials[i]->available()) {
                     uint8_t b = (uint8_t)espSerials[i]->read();
                     if (cp[i].count == 0) {
@@ -658,16 +740,35 @@ void runCalibration()
                             uint8_t chk = 0;
                             for (int j = 0; j < PACKET_SIZE - 1; j++) chk ^= cp[i].buf[j];
                             if (chk == cp[i].buf[PACKET_SIZE - 1]) {
-                                float raw;
-                                memcpy(&raw, &cp[i].buf[6], sizeof(float));
-                                sinSum[i] += sin((double)raw);
-                                cosSum[i] += cos((double)raw);
-                                count[i]++;
+                                memcpy(&cp[i].phase, &cp[i].buf[6], sizeof(float));
+                                cp[i].time  = (uint32_t)millis();
+                                cp[i].fresh = true;
+                                alive[i]    = true;
                             }
                         }
                     }
                 }
             }
+            if (!cp[CAL_REFERENCE_NODE].fresh) continue;
+            uint32_t refTime  = cp[CAL_REFERENCE_NODE].time;
+            float    refPhase = cp[CAL_REFERENCE_NODE].phase;
+            for (int i = 0; i < NUM_ESP_NODES; i++) {
+                if (i == CAL_REFERENCE_NODE) continue;
+                if (!cp[i].fresh) continue;
+                uint32_t dt = cp[i].time > refTime ? cp[i].time - refTime
+                                                   : refTime  - cp[i].time;
+                if (dt > SNAP_SYNC_MS) { cp[i].fresh = false; continue; }
+                if (count[i] < CAL_MIN_SAMPLES) {
+                    float delta = cp[i].phase - refPhase;
+                    sinDiff[i] += sin((double)delta);
+                    cosDiff[i] += cos((double)delta);
+                    count[i]++;
+                }
+                cp[i].fresh = false;
+            }
+            if (count[CAL_REFERENCE_NODE] < CAL_MIN_SAMPLES)
+                count[CAL_REFERENCE_NODE]++;
+            cp[CAL_REFERENCE_NODE].fresh = false;
         }
         Serial.println("[CAL] Retry results:");
         for (int node = 0; node < NUM_ESP_NODES; node++)
@@ -682,52 +783,32 @@ void runCalibration()
     Serial.println("[CAL] Relay settled — back on antenna path");
     Serial.println("[CAL] RF switches → ANTENNA path");
 
-    // Pass 1: compute circular mean for nodes that received data
-    float meanPhase[NUM_ESP_NODES] = {};
-    for (int node = 0; node < NUM_ESP_NODES; node++) {
-        if (count[node] > 0) {
-            meanPhase[node] = (float)atan2(
-                sinSum[node] / count[node],
-                cosSum[node] / count[node]);
-        }
-    }
-
-    // Pass 2: determine actual reference — prefer CAL_REFERENCE_NODE, fall back
-    // to the first node that received data if the preferred one has none
-    int refNode = -1;
-    if (count[CAL_REFERENCE_NODE] > 0) {
-        refNode = CAL_REFERENCE_NODE;
-    } else {
-        for (int node = 0; node < NUM_ESP_NODES; node++) {
-            if (count[node] > 0) { refNode = node; break; }
-        }
-    }
-    if (refNode < 0) {
-        Serial.println("[CAL] ERROR: No nodes received data — calibration aborted");
-        return;
-    }
-    if (refNode != CAL_REFERENCE_NODE) {
-        Serial.printf("[CAL] WARN: Preferred reference node %d has no data — using node %d instead\n",
-                      CAL_REFERENCE_NODE, refNode);
-    }
-
-    // Build calValid bitmask and fill in missing nodes
+    // Compute phaseCorrection[i] = -mean(delta_i) = -mean(phase_i - phase_ref).
+    // Applying this during streaming: corrected_i = raw_i + correction_i
+    //   = (hardware_i + carrier) + (-(hardware_i - hardware_ref))
+    //   = hardware_ref + carrier   ← same for all nodes → relative phases zero out
+    //
+    // Reference node always gets correction = 0 (delta_ref = 0 by construction).
     calValid = 0x00;
     for (int node = 0; node < NUM_ESP_NODES; node++) {
         if (count[node] >= CAL_MIN_SAMPLES) {
             calValid |= (1 << node);
+            float meanDelta = (float)atan2(sinDiff[node] / count[node],
+                                           cosDiff[node] / count[node]);
+            phaseCorrection[node] = -meanDelta;
         } else {
-            Serial.printf("[CAL] WARN: Node %d uncalibrated (%d samples) — excluded from array\n",
+            phaseCorrection[node] = 0.0f;  // no correction — will be masked in Python
+            Serial.printf("[CAL] WARN: Node %d uncalibrated (%d sync-snapshots) — excluded\n",
                           node, count[node]);
-            meanPhase[node] = meanPhase[refNode];  // correction = 0, will be masked in Python
         }
     }
+    // Reference node correction is exactly zero by definition
+    phaseCorrection[CAL_REFERENCE_NODE] = 0.0f;
 
-    Serial.printf("[CAL] Correction vector (node %d = reference):\n", refNode);
+    Serial.printf("[CAL] Correction vector (node %d = reference):\n", CAL_REFERENCE_NODE);
     for (int node = 0; node < NUM_ESP_NODES; node++) {
-        phaseCorrection[node] = meanPhase[refNode] - meanPhase[node];
-        Serial.printf("[CAL]   Node %d  mean=% .4f rad  correction=% .4f rad  %s\n",
-                      node, meanPhase[node], phaseCorrection[node],
+        Serial.printf("[CAL]   Node %d  snapshots=%d  correction=% .4f rad  %s\n",
+                      node, count[node], phaseCorrection[node],
                       (calValid >> node) & 1 ? "CAL" : "UNCAL");
     }
     Serial.printf("[CAL] Valid node mask: 0x%02X\n", calValid);
